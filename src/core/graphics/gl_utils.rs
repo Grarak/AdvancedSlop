@@ -1,0 +1,198 @@
+use crate::presenter::Presenter;
+use crate::utils::StrErr;
+use gl::types::{GLenum, GLuint};
+use std::ptr;
+
+macro_rules! shader_source {
+    ($name:expr) => {{
+        #[cfg(not(target_os = "vita"))]
+        {
+            include_str!(concat!("shaders/glsl/", $name, ".glsl"))
+        }
+        #[cfg(target_os = "vita")]
+        {
+            include_str!(concat!("shaders/cg/", $name, ".cg"))
+        }
+    }};
+    ($path:expr, $name:expr) => {{
+        #[cfg(not(target_os = "vita"))]
+        {
+            include_str!(concat!($path, "/glsl/", $name, ".glsl"))
+        }
+        #[cfg(target_os = "vita")]
+        {
+            include_str!(concat!($path, "/cg/", $name, ".cg"))
+        }
+    }};
+}
+
+use crate::logging::info_println;
+pub(in crate::core::graphics) use shader_source;
+
+pub unsafe fn create_shader(name: impl Into<String>, shader_src: &str, typ: GLenum) -> Result<GLuint, StrErr> {
+    let shader_name = match typ {
+        gl::FRAGMENT_SHADER => "fragment shader",
+        gl::VERTEX_SHADER => "vertex shader",
+        _ => return Err(StrErr::new("unknown shader")),
+    };
+    info_println!("Compiling {} as {shader_name}", name.into());
+
+    let shader = gl::CreateShader(typ);
+    if shader == 0 {
+        return Err(StrErr::new("Failed to create shader"));
+    }
+
+    let mut shader_src = shader_src.to_string();
+    if cfg!(not(target_os = "vita")) && !shader_src.starts_with("#version 300 es") {
+        shader_src = "#version 300 es\n".to_string() + &shader_src;
+    }
+
+    // Append gl version to end of shader file to invalidate shader cache
+    let shader_src = shader_src + &format!("\n// version: {}", Presenter::gl_version_suffix());
+    let src_ptr = shader_src.as_ptr();
+    let src_len = shader_src.len();
+    gl::ShaderSource(shader, 1, ptr::addr_of!(src_ptr) as _, ptr::addr_of!(src_len) as _);
+    gl::CompileShader(shader);
+    let mut compiled = 0;
+    gl::GetShaderiv(shader, gl::COMPILE_STATUS, &mut compiled);
+
+    if compiled == 0 {
+        let mut info_len = 0;
+        gl::GetShaderiv(shader, gl::INFO_LOG_LENGTH, &mut info_len);
+
+        if info_len > 1 {
+            let mut info = Vec::new();
+            Vec::resize(&mut info, info_len as usize, 0u8);
+            gl::GetShaderInfoLog(shader, info_len, ptr::null_mut(), info.as_mut_ptr() as _);
+            gl::DeleteShader(shader);
+            return Err(StrErr::new(String::from_utf8(info).unwrap()));
+        }
+
+        gl::DeleteShader(shader);
+        return Err(StrErr::new("Failed to compile shader"));
+    }
+    Ok(shader)
+}
+
+pub unsafe fn create_program(shaders: &[GLuint]) -> Result<GLuint, StrErr> {
+    let program = gl::CreateProgram();
+    for shader in shaders {
+        gl::AttachShader(program, *shader);
+    }
+    gl::LinkProgram(program);
+
+    let mut linked = 0;
+    gl::GetProgramiv(program, gl::LINK_STATUS, &mut linked);
+    if linked == 0 {
+        let mut info_len = 0;
+        gl::GetProgramiv(program, gl::INFO_LOG_LENGTH, &mut info_len);
+        if info_len > 1 {
+            let mut info = Vec::new();
+            Vec::resize(&mut info, info_len as usize, 0u8);
+            gl::GetProgramInfoLog(program, info_len, ptr::null_mut(), info.as_mut_ptr() as _);
+            gl::DeleteProgram(program);
+            return Err(StrErr::new(String::from_utf8(info).unwrap()));
+        }
+
+        gl::DeleteProgram(program);
+        return Err(StrErr::new("Failed to link program"));
+    }
+    Ok(program)
+}
+
+pub unsafe fn create_fb_color(width: u32, height: u32) -> GLuint {
+    let mut tex = 0;
+    gl::GenTextures(1, &mut tex);
+    gl::BindTexture(gl::TEXTURE_2D, tex);
+    // Sized internalformat: unsized GL_RGBA is not a color-renderable format on
+    // strict GLES3 drivers (Adreno rejects the FBO attachment), only lenient ones
+    // (llvmpipe/v3d/virgl) accepted it.
+    gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RGBA8 as _, width as _, height as _, 0, gl::RGBA, gl::UNSIGNED_BYTE, ptr::null());
+    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as _);
+    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as _);
+    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as _);
+    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
+    gl::BindTexture(gl::TEXTURE_2D, 0);
+    tex
+}
+
+pub unsafe fn create_fb_depth_tex(fbo: GLuint, width: u32, height: u32, stencil: bool) -> GLuint {
+    gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
+    if cfg!(not(target_os = "vita")) {
+        let mut tex = 0;
+        gl::GenTextures(1, &mut tex);
+        gl::BindTexture(gl::TEXTURE_2D, tex);
+        gl::TexImage2D(
+            gl::TEXTURE_2D,
+            0,
+            if stencil { gl::DEPTH24_STENCIL8 as _ } else { gl::DEPTH_COMPONENT24 as _ },
+            width as _,
+            height as _,
+            0,
+            if stencil { gl::DEPTH_STENCIL } else { gl::DEPTH_COMPONENT },
+            if stencil { gl::UNSIGNED_INT_24_8 } else { gl::UNSIGNED_INT },
+            ptr::null(),
+        );
+        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as _);
+        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as _);
+        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as _);
+        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
+        gl::FramebufferTexture2D(gl::FRAMEBUFFER, if stencil { gl::DEPTH_STENCIL_ATTACHMENT } else { gl::DEPTH_ATTACHMENT }, gl::TEXTURE_2D, tex, 0);
+        tex
+    } else {
+        let mut buf = 0;
+        gl::GenRenderbuffers(1, &mut buf);
+        gl::BindRenderbuffer(gl::RENDERBUFFER, buf);
+        gl::RenderbufferStorage(gl::RENDERBUFFER, if stencil { gl::DEPTH24_STENCIL8 } else { gl::DEPTH_COMPONENT24 }, width as _, height as _);
+        gl::FramebufferRenderbuffer(gl::FRAMEBUFFER, if stencil { gl::DEPTH_STENCIL_ATTACHMENT } else { gl::DEPTH_ATTACHMENT }, gl::RENDERBUFFER, buf);
+        Presenter::gl_create_depth_tex()
+    }
+}
+
+pub struct GpuFbo {
+    pub color: GLuint,
+    pub depth: Option<GLuint>,
+    pub fbo: GLuint,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl GpuFbo {
+    fn from_tex_internal(width: u32, height: u32, depth: bool, stencil: bool, tex: GLuint) -> Result<Self, StrErr> {
+        unsafe {
+            debug_assert!(depth || !stencil);
+
+            let mut fbo = 0;
+            gl::GenFramebuffers(1, &mut fbo);
+            gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
+            gl::FramebufferTexture2D(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, tex, 0);
+
+            let depth = if depth { Some(create_fb_depth_tex(fbo, width, height, stencil)) } else { None };
+
+            let status = gl::CheckFramebufferStatus(gl::FRAMEBUFFER);
+            gl::BindRenderbuffer(gl::RENDERBUFFER, 0);
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            if status != gl::FRAMEBUFFER_COMPLETE {
+                Err(StrErr::new(format!("Failed to create fbo: {status}")))
+            } else {
+                Ok(GpuFbo {
+                    color: tex,
+                    depth,
+                    fbo,
+                    width,
+                    height,
+                })
+            }
+        }
+    }
+
+    pub fn new(width: u32, height: u32, depth: bool, stencil: bool) -> Result<Self, StrErr> {
+        unsafe { Self::from_tex_internal(width, height, depth, stencil, create_fb_color(width, height)) }
+    }
+}
+
+impl Drop for GpuFbo {
+    fn drop(&mut self) {
+        unsafe { gl::DeleteFramebuffers(1, &self.fbo) };
+    }
+}

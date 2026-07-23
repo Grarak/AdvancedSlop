@@ -1,0 +1,182 @@
+use crate::mmap::{Shm, VirtualMem, PAGE_SIZE};
+#[cfg(target_arch = "arm")]
+use std::arch::arm::{vld4q_u32, vst4q_u32};
+use std::marker::PhantomData;
+use std::ops::{Index, IndexMut};
+use std::{
+    fmt::{Debug, Formatter},
+    mem,
+};
+
+pub struct FastFixedFifo<T, const SIZE: usize> {
+    start: usize,
+    len: usize,
+    end: usize,
+    _shm: Shm,
+    vmem: VirtualMem,
+    _type: PhantomData<T>,
+}
+
+impl<T, const SIZE: usize> FastFixedFifo<T, SIZE> {
+    pub fn new() -> Self {
+        let total_size = size_of::<T>() * SIZE;
+        debug_assert!(total_size > PAGE_SIZE);
+        debug_assert_eq!(total_size % SIZE, 0);
+
+        let mut vmem = VirtualMem::new(total_size * 2, 0).unwrap();
+        let shm = Shm::new("fast_fixed_fifo", total_size).unwrap();
+        for addr in (0..total_size).step_by(PAGE_SIZE) {
+            vmem.create_map(&shm, addr, addr, PAGE_SIZE, true, true, false).unwrap();
+            vmem.create_map(&shm, addr, addr + total_size, PAGE_SIZE, true, true, false).unwrap();
+        }
+        FastFixedFifo {
+            len: 0,
+            start: 0,
+            end: 0,
+            _shm: shm,
+            vmem,
+            _type: PhantomData,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    pub fn push_front(&mut self, value: T) {
+        self.start = self.start.wrapping_sub(1) % SIZE;
+        unsafe { (self.vmem.as_mut_ptr() as *mut T).add(self.start).write(value) };
+        self.len += 1;
+        debug_assert!(self.len <= SIZE);
+    }
+
+    #[inline(always)]
+    pub fn push_back(&mut self, value: T) {
+        unsafe { (self.vmem.as_mut_ptr() as *mut T).add(self.end).write(value) };
+        self.end = (self.end + 1) % SIZE;
+        self.len += 1;
+        debug_assert!(self.len <= SIZE);
+    }
+
+    pub fn front(&self) -> &T {
+        unsafe { mem::transmute((self.vmem.as_ptr() as *const T).add(self.start)) }
+    }
+
+    pub fn front_ptr(&self) -> *const T {
+        unsafe { (self.vmem.as_ptr() as *const T).add(self.start) }
+    }
+
+    pub fn front_ptr_mut(&mut self) -> *mut T {
+        unsafe { (self.vmem.as_mut_ptr() as *mut T).add(self.start) }
+    }
+
+    pub fn pop_front(&mut self) {
+        self.start = (self.start + 1) % SIZE;
+        self.len -= 1;
+    }
+
+    pub fn pop_front_multiple(&mut self, count: usize) {
+        self.start = (self.start + count) % SIZE;
+        self.len -= count;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.len() == SIZE
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.start = 0;
+        self.end = 0;
+    }
+
+    pub fn pos_front(&self) -> usize {
+        self.start
+    }
+
+    pub fn pos_end(&self) -> usize {
+        self.end
+    }
+}
+
+// Contents live in host vmem, so serialize logically: the mirrored mapping makes
+// [front_ptr, front_ptr + len) contiguous for any start; load renormalizes to start = 0
+impl<T: Copy, const SIZE: usize> crate::savestate::Savestate for FastFixedFifo<T, SIZE> {
+    fn savestate(&mut self, state: &mut crate::savestate::SavestateContext) {
+        let mut len = self.len;
+        len.savestate(state);
+        if state.is_save() {
+            state.pod_slice(unsafe { std::slice::from_raw_parts_mut(self.front_ptr_mut(), self.len) });
+        } else {
+            self.clear();
+            if len > SIZE {
+                state.set_error();
+                return;
+            }
+            state.pod_slice(unsafe { std::slice::from_raw_parts_mut(self.vmem.as_mut_ptr() as *mut T, len) });
+            self.len = len;
+            self.end = len % SIZE;
+        }
+    }
+}
+
+impl<T: Copy, const SIZE: usize> FastFixedFifo<T, SIZE> {
+    #[inline(always)]
+    pub fn push_back_multiple<const FAST_MEMCPY: bool>(&mut self, values: &[T]) {
+        let end = self.end;
+        self.end = (end + values.len()) % SIZE;
+        self.len += values.len();
+        debug_assert!(self.len <= SIZE);
+        unsafe {
+            let ptr = (self.vmem.as_mut_ptr() as *mut T).add(end);
+            if FAST_MEMCPY {
+                for i in (0..values.len()).step_by(64 / size_of::<T>()) {
+                    let src_ptr = values.as_ptr().add(i);
+                    let values = vld4q_u32(src_ptr as _);
+                    vst4q_u32(ptr.add(i) as _, values);
+                }
+            } else {
+                for i in 0..values.len() {
+                    ptr.add(i).write(values[i]);
+                }
+            }
+        }
+    }
+}
+
+impl<T: Default, const SIZE: usize> Default for FastFixedFifo<T, SIZE> {
+    fn default() -> Self {
+        FastFixedFifo::new()
+    }
+}
+
+impl<T: Debug, const SIZE: usize> Debug for FastFixedFifo<T, SIZE> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut list = f.debug_list();
+        for i in 0..self.len() {
+            list.entry(&self[i]);
+        }
+        list.finish()
+    }
+}
+
+impl<T, const SIZE: usize> Index<usize> for FastFixedFifo<T, SIZE> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        let index = (index + self.start) % SIZE;
+        unsafe { mem::transmute((self.vmem.as_ptr() as *const T).add(index)) }
+    }
+}
+
+impl<T, const SIZE: usize> IndexMut<usize> for FastFixedFifo<T, SIZE> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        let index = (index + self.start) % SIZE;
+        unsafe { mem::transmute((self.vmem.as_mut_ptr() as *mut T).add(index)) }
+    }
+}

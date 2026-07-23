@@ -1,0 +1,68 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "*" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - flavor: release-debug
+          - flavor: release
+            env: RUSTFLAGS="-Zlocation-detail=none -Zfmt-debug=none -Clto=fat -Zub-checks=no -Zsaturating-float-casts=no -Ztrap-unreachable=no -Zmir-opt-level=4"
+
+    runs-on: ubuntu-latest
+
+    name: Build ${{ matrix.flavor }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install clang 21
+        run: curl https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
+
+      - name: Checkout vitasdk
+        uses: actions/checkout@v4
+        with:
+          repository: vitasdk/vdpm
+          path: vdpm
+
+      - name: Install vitasdk
+        run: |
+          cd vdpm
+          ./bootstrap-vitasdk.sh
+          ./install-all.sh
+        env:
+          VITASDK: /usr/local/vitasdk
+
+      - name: Install cargo-vita
+        run: cargo +nightly install cargo-vita
+        env:
+          VITASDK: /usr/local/vitasdk
+
+      - name: Build
+        run: ${{ matrix.env }} cargo vita build vpk --profile ${{ matrix.flavor }}
+        env:
+          VITASDK: /usr/local/vitasdk
+          CARGO_INCREMENTAL: 0
+
+      - name: Upload vpk
+        uses: actions/upload-artifact@v4
+        with:
+          name: advancedslop-${{ matrix.flavor }}-vpk
+          path: target/armv7-sony-vita-newlibeabihf/${{ matrix.flavor }}/advancedslop.vpk
+
+      - name: Upload elf
+        uses: actions/upload-artifact@v4
+        with:
+          name: advancedslop-${{ matrix.flavor }}-elf
+          path: target/armv7-sony-vita-newlibeabihf/${{ matrix.flavor }}/advancedslop.elf

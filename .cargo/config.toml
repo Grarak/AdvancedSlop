@@ -1,0 +1,9 @@
+[target.thumbv7neon-unknown-linux-gnueabihf]
+linker = "clang-21"
+rustflags = ["-Ctarget-feature=+v7,+neon,+vfp3,+thumb2,+thumb-mode"]
+
+[target.armv7-sony-vita-newlibeabihf]
+linker = "clang-21"
+
+[unstable]
+build-std = ["core", "alloc", "std", "panic_abort"]

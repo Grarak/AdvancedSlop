@@ -1,0 +1,9 @@
+/target
+/tools/trace-decode/target
+/.idea
+/.vscode
+.DS_Store
+.env
+/.claude/scheduled_tasks.lock
+/tmp/
+*.log

@@ -1,0 +1,114 @@
+workspace = { members = ["macros", "vitabuild", "vitaGL", "vixl", "rcheevos"] }
+[package]
+name = "advancedslop"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[package.metadata.vita]
+title_id = "ADVSLOP00"
+title_name = "AdvancedSlop"
+build_std = "std,core,panic_abort,alloc"
+assets = "./static"
+vita_make_fself_flags = ["-a", "0x2800000000000001", "-na"]
+
+[dependencies]
+bilge = { git = "https://github.com/Grarak/bilge.git" }
+chrono = "0.4.40"
+advancedslop_macros = { path = "macros" }
+enum_dispatch = "0.3.13"
+gl = { git = "https://github.com/bjz/gl-rs" }
+glyph_brush = "0.7.12"
+lazy_static = "1.5.0"
+nalgebra = "0.34.1"
+paste = "1.0.15"
+rust-ini = "0.21.1"
+static_assertions = "1.1.0"
+strum = "0.27.1"
+strum_macros = "0.27.1"
+vixl = { path = "vixl" }
+xxhash-rust = { version = "0.8.15", features = ["xxh32"] }
+libc = "0.2.186"
+
+png = "0.18.1"
+jpeg-encoder = "0.6.1"
+jpeg-decoder = { version = "0.3.2", default-features = false }
+# Already in the tree transitively (png -> flate2); used directly for savestate compression
+miniz_oxide = "0.8"
+rcheevos = { path = "rcheevos" }
+
+[patch.crates-io]
+simd-adler32 = { git = 'https://github.com/Grarak/simd-adler32.git' }
+openssl-sys = { git = 'https://github.com/Grarak/rust-openssl.git' }
+
+[target.thumbv7neon-unknown-linux-gnueabihf.dependencies]
+clap = { version = "4.5.17", features = ["cargo"] }
+sdl2 = "0.35.0"
+affinity = "0.1.2"
+backtrace = "0.3.74"
+
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "rustls-tls"] }
+
+[build-dependencies]
+bindgen = "0.72.1"
+vitabuild = { path = "vitabuild" }
+
+[target.armv7-sony-vita-newlibeabihf.dependencies]
+vitasdk-sys = { version = "0.3.2", features = [
+    "SceAppMgr_stub",
+    "SceAppUtil_stub",
+    "SceAudio_stub",
+    "SceAudioIn_stub",
+    "SceCommonDialog_stub",
+    "SceCtrl_stub",
+    "SceDisplay_stub",
+    "SceGxm_stub",
+    "SceKernelDmacMgr_stub",
+    "SceKernelThreadMgr_stub",
+    "SceLibKernel_stub",
+    "ScePgf_stub",
+    "ScePower_stub",
+#    "SceRazorCapture_stub",
+    "SceShaccCg_stub",
+    "SceShellSvc_stub",
+    "SceSysmem_stub",
+    "SceSysrootForKernel_stub",
+    "SceTouch_stub",
+    "SceVshBridge_stub",
+    "SceKernelModulemgr_stub",
+] }
+vita_gl = { path = "vitaGL" }
+
+openssl-sys = "=0.9.111"
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "native-tls"] }
+
+# The dev/debug profile is the tracing build: DEBUG_LOG keys off the profile NAME
+# ("debug"), so `cargo build` yields the instrumented emulator directly — no source
+# toggling — and opt-level 3 keeps it fast enough for multi-million-record captures.
+[profile.dev]
+opt-level = 3
+
+[profile.release-debug]
+inherits = "dev"
+opt-level = 3
+overflow-checks = true
+debug-assertions = true
+debug = true
+
+[profile.release.package."*"]
+opt-level = 3
+codegen-units = 1
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 3
+codegen-units = 1
+
+[profile.release-profiling]
+inherits = "release"
+panic = "abort"
+lto = true
+opt-level = 3
+debug = true
