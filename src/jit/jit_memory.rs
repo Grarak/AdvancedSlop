@@ -452,6 +452,29 @@ impl JitMemory {
         }
     }
 
+    /// Invalidate every block compiled out of guest RAM, leaving rom-derived blocks — and
+    /// the code allocator — alone. Same shape as `invalidate_block`, applied to the whole
+    /// of ewram/iwram at once: clear the entries, the live ranges and the hotness counts,
+    /// and touch nothing the allocator owns (orphaned code is reclaimed by `reset_blocks`
+    /// exactly as it is after a normal SMC invalidation).
+    ///
+    /// For rewind this is equivalent to `init` but ~100x cheaper. A restore rolls back
+    /// only guest RAM — the rom lies outside `SAVESTATE_SHM_RANGE` and is written once per
+    /// game — so rom blocks cannot go stale. `init` would also refill the rom-keyed
+    /// tables, and those dominate: 16M jit entries plus 16 MB of hotness counters, ~80 MB
+    /// of memset, measured at 11 ms per call on the pi.
+    pub fn invalidate_ram_blocks(&mut self) {
+        self.jit_entries.ewram.fill(DEFAULT_JIT_ENTRY);
+        self.jit_entries.iwram.fill(DEFAULT_JIT_ENTRY);
+        self.jit_live_ranges.ewram.fill(0);
+        self.jit_live_ranges.iwram.fill(0);
+        self.jit_exec_counts.ewram.fill(0);
+        self.jit_exec_counts.iwram.fill(0);
+        self.sticky_smc_ewram.fill(0);
+        self.sticky_smc_iwram.fill(0);
+        self.sticky_pages = 0;
+    }
+
     pub fn init(&mut self, _: &Settings) {
         self.arm7_data = JitMemoryMetadata::new(JIT_MEMORY_SIZE, 0, JIT_MEMORY_SIZE);
         self.jit_entries.reset();

@@ -150,6 +150,11 @@ impl Emu {
         // guest could have overwritten it since (dma'ing an overlay in, say), and the
         // jit's smc tracking only watches guest writes, not our restores. §5.1 is what
         // stale blocks across a code reload cost.
-        self.jit.init(&self.settings);
+        //
+        // RAM only, not a full `jit.init`: a restore rolls back exactly the shm range the
+        // savestate walk covers, and the rom is not in it. Blocks compiled out of rom stay
+        // valid, so their tables — 80 MB of them — need not be refilled. That is the whole
+        // difference between a rewind frame costing 11 ms and costing 0.1 ms.
+        self.jit.invalidate_ram_blocks();
     }
 }
