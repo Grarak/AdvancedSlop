@@ -8,6 +8,7 @@ use crate::core::input::Input;
 use crate::core::memory::cartridge::Cartridge;
 use crate::core::memory::dma::Dma;
 use crate::core::memory::mem::Memory;
+use crate::core::rewind::Rewind;
 use crate::core::rtc::Rtc;
 use crate::core::thread_regs::ThreadRegs;
 use crate::core::timers::Timers;
@@ -30,6 +31,8 @@ pub struct Emu {
     pub dma: Dma,
     pub timers: Timers,
     pub jit: JitMemory,
+    // Host-side rewind ring. Not guest state: never part of the savestate walk.
+    pub rewind: Rewind,
     pub settings: Settings,
     pub breakout_imm: bool,
     initialized: bool,
@@ -49,6 +52,7 @@ impl Emu {
             dma: Dma::new(),
             timers: Timers::new(),
             jit,
+            rewind: Rewind::new(),
             settings: DEFAULT_SETTINGS.clone(),
             breakout_imm: false,
             initialized: true,
@@ -68,6 +72,8 @@ impl Emu {
             self.dma = Dma::new();
             self.timers = Timers::new();
         }
+        // Whatever the ring holds belongs to the game that just ended
+        self.rewind.clear();
         self.initialized = false;
     }
 
@@ -214,5 +220,9 @@ impl Emu {
         // here and nowhere else in a frame: cm events are dispatched between jit execute
         // calls (execute_jit), so no compiled frame is on the stack.
         self.jit.init(&self.settings);
+
+        // The ring holds the timeline the player just left; keeping it would rewind from
+        // the loaded state into frames of a different one.
+        self.rewind.clear();
     }
 }

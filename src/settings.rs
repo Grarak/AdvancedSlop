@@ -197,6 +197,7 @@ pub(crate) enum SettingId {
     ShowDebugStatistics,
     Retroachievements,
     SavestateOnExit,
+    Rewind,
 }
 
 impl SettingId {
@@ -231,6 +232,13 @@ impl SettingId {
                 SettingGroup::System,
             ),
             SettingId::ShowDebugStatistics => Setting::new("Show debug statistics", "Show FPS and other debug information while playing.", SettingValue::Bool(true), true, SettingGroup::System),
+            SettingId::Rewind => Setting::new(
+                "Rewind",
+                "Hold the rewind button to step back through the last few seconds. Costs memory and a little speed while enabled.",
+                SettingValue::Bool(false),
+                true,
+                SettingGroup::Emulation,
+            ),
             SettingId::Retroachievements => Setting::new(
                 "RetroAchievements",
                 "Unlock achievements in supported games. Needs an account and an internet connection; log in from the settings menu.",
@@ -295,6 +303,10 @@ impl Settings {
 
     pub fn savestate_on_exit(&self) -> bool {
         unsafe { self.0[SettingId::SavestateOnExit as usize].value.as_bool().unwrap_unchecked() }
+    }
+
+    pub fn rewind(&self) -> bool {
+        unsafe { self.0[SettingId::Rewind as usize].value.as_bool().unwrap_unchecked() }
     }
 
     pub fn retroachievements(&self) -> bool {

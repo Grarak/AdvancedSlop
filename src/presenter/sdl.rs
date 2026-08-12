@@ -291,6 +291,11 @@ impl Presenter {
                     if code == keyboard::Keycode::PrintScreen {
                         return PresentEvent::Screenshot;
                     }
+                    // Rewind is a hold, not a press, so it drives an atomic the emulation
+                    // thread samples at its vblank hook rather than a one-shot event.
+                    if code == keyboard::Keycode::Backspace {
+                        crate::core::rewind::set_rewind_held(true);
+                    }
                     if code == keyboard::Keycode::F12 {
                         return PresentEvent::CycleScreenLayout;
                     }
@@ -299,6 +304,9 @@ impl Presenter {
                     }
                 }
                 Event::KeyUp { keycode: Some(code), .. } => {
+                    if code == keyboard::Keycode::Backspace {
+                        crate::core::rewind::set_rewind_held(false);
+                    }
                     if let Some(code) = self.key_code_mapping.get(&code) {
                         self.keymap |= 1 << *code as u8;
                     }

@@ -232,6 +232,9 @@ impl Emu {
                     crate::savestate::SavestateRequest::LoadQuick => self.loadstate_from_quick_slot(),
                 }
             }
+            // After savestate handling: a state that was just loaded becomes the new
+            // timeline's first frame rather than being rewound out of immediately.
+            self.rewind_on_frame();
             self.input_process_hotkeys();
         }
     }

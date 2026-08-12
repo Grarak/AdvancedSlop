@@ -230,6 +230,9 @@ impl Presenter {
         // the one input that cannot collide with the game. (When the custom-binding path
         // reaches poll_event, these should become configurable like the rest.)
         const STICK_THRESHOLD: i32 = 64;
+        // Rewind is a hold, so it drives an atomic the emulation thread samples rather
+        // than an event; the stick's other axis carries the save/load edges below.
+        crate::core::rewind::set_rewind_held(pressed.rx as i32 - 128 < -STICK_THRESHOLD);
         let ry = pressed.ry as i32 - 128;
         let stick_up = ry < -STICK_THRESHOLD;
         let stick_down = ry > STICK_THRESHOLD;

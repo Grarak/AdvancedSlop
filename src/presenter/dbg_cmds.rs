@@ -4,7 +4,7 @@
 //
 // Newline/broadcast-delimited text commands:
 //   press/release <btn> | buttons [<btn>...] |
-//   framelimit <0..9> | pause | savestate | loadstate | inst-log | quit
+//   framelimit <0..9> | pause | savestate | loadstate | rewind <on|off> | inst-log | quit
 // btn: a b up down left right start select l r. inst-log arms --inst-log-lazy
 // capture. Replies "ok" or "err: ...".
 
@@ -85,6 +85,19 @@ pub fn handle_debug_cmd(state: &DebugState, line: &str) -> String {
             state.quick_load.store(true, Ordering::Relaxed);
             "ok".to_owned()
         }
+        // Rewind is a held input, so it is set/cleared rather than pulsed. Straight to the
+        // module: it is an atomic the emulation thread samples, with no frame to capture.
+        "rewind" => match it.next() {
+            Some("on") => {
+                crate::core::rewind::set_rewind_held(true);
+                "ok".to_owned()
+            }
+            Some("off") => {
+                crate::core::rewind::set_rewind_held(false);
+                "ok".to_owned()
+            }
+            _ => "err: rewind <on|off>".to_owned(),
+        },
         "inst-log" => {
             crate::debug_inst_log::arm_lazy();
             "ok".to_owned()

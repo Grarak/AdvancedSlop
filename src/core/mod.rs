@@ -11,6 +11,7 @@ pub mod hle;
 pub mod input;
 pub mod memory;
 pub mod ppu;
+pub mod rewind;
 pub mod rtc;
 pub mod thread_regs;
 pub mod timers;
