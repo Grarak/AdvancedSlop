@@ -221,7 +221,7 @@ impl Emu {
         if unlikely(self.gpu.v_count == VISIBLE_LINES) {
             if let Some(request) = crate::savestate::take_request() {
                 match request {
-                    crate::savestate::SavestateRequest::Save { screenshot } => self.savestate_to_file(&screenshot),
+                    crate::savestate::SavestateRequest::Save { target, screenshot } => self.savestate_to_file(target, &screenshot),
                     crate::savestate::SavestateRequest::Load { data } => {
                         if self.load_state(data) {
                             crate::logging::info_println!("Savestate loaded");
@@ -229,6 +229,7 @@ impl Emu {
                             crate::logging::info_println!("Savestate load failed (corrupt)");
                         }
                     }
+                    crate::savestate::SavestateRequest::LoadQuick => self.loadstate_from_quick_slot(),
                 }
             }
             self.input_process_hotkeys();
@@ -353,6 +354,17 @@ impl SoftRenderer {
         &mut *self.regs[slot].get()
     }
 
+    /// A whole composed pixel buffer, as the workers left it. Read-only, and only
+    /// sound for a buffer no worker currently owns (the savestate screenshot reads the
+    /// last presented one while the game is paused).
+    unsafe fn buf(&self, index: usize) -> &[u32] {
+        #[cfg(target_os = "vita")]
+        let base = self.tex_ptrs[index] as *const u32;
+        #[cfg(not(target_os = "vita"))]
+        let base = self.pixels[index].as_ptr();
+        std::slice::from_raw_parts(base, DISPLAY_PIXEL_COUNT)
+    }
+
     /// Publishes a composed buffer and returns the fbo holding it.
     unsafe fn upload(&self, index: usize) -> gl::types::GLuint {
         // Nothing to upload on the Vita: those scanlines landed in the texture itself
@@ -466,6 +478,10 @@ pub struct GbaRenderer {
     // Set by the main thread to freeze the game for the pause menu; the cpu thread
     // parks itself at the next vblank handoff until it clears.
     pause: AtomicBool,
+    // One-shot ticket that lets the parked cpu thread past the pause loop without
+    // resuming the game: it then reaches the savestate hook a few lines below the park,
+    // performs the queued save/load, runs one frame and parks again.
+    pause_step: AtomicBool,
     present_rect: (i32, i32, i32, i32),
     sync: RenderSync,
     // The emulation thread never sleeps on this; it is for the three that do.
@@ -505,6 +521,7 @@ impl GbaRenderer {
         GbaRenderer {
             quit: AtomicBool::new(false),
             pause: AtomicBool::new(false),
+            pause_step: AtomicBool::new(false),
             present_rect: (0, 0, crate::presenter::PRESENTER_SCREEN_WIDTH as i32, crate::presenter::PRESENTER_SCREEN_HEIGHT as i32),
             sync: RenderSync::default(),
             wake_mutex: Mutex::new(()),
@@ -579,6 +596,7 @@ impl GbaRenderer {
     pub fn reset_for_new_game(&mut self, shm: &Shm) {
         self.quit.store(false, Ordering::Relaxed);
         self.pause.store(false, Ordering::Relaxed);
+        self.pause_step.store(false, Ordering::Relaxed);
         self.sync = RenderSync::default();
         self.write_slot = 0;
         self.read_slot = 0;
@@ -590,6 +608,14 @@ impl GbaRenderer {
 
     pub fn set_pause(&self, pause: bool) {
         self.pause.store(pause, Ordering::Release);
+    }
+
+    /// Wake the paused cpu thread for exactly one frame, leaving the pause in place.
+    /// Used to let it consume a savestate request queued from the pause menu: the
+    /// request is handled at the vblank hook it parks in, then it parks again.
+    pub fn step_paused_frame(&self, cpu_thread: &std::thread::Thread) {
+        self.pause_step.store(true, Ordering::Release);
+        cpu_thread.unpark();
     }
 
     /// Rasterizes one visible scanline into the buffer the cpu thread currently owns.
@@ -630,8 +656,15 @@ impl GbaRenderer {
         self.stats.count_frame();
 
         // Pause: freeze the game between frames (the last frame is already handed over,
-        // so the pause menu draws over it). The main thread unparks on resume/quit.
+        // so the pause menu draws over it). The main thread unparks on resume/quit, or
+        // hands over a single-frame ticket (step_paused_frame) so a savestate request
+        // queued from the menu gets consumed at the hook a few lines below without the
+        // game actually resuming. Testing the ticket before parking is what makes the
+        // set-then-unpark pair race-free in both orders.
         while self.pause.load(Ordering::Acquire) && !self.quit.load(Ordering::Relaxed) {
+            if self.pause_step.swap(false, Ordering::AcqRel) {
+                break;
+            }
             std::thread::park();
         }
     }
@@ -724,6 +757,36 @@ impl GbaRenderer {
 
     pub fn set_present_rect(&mut self, rect: (i32, i32, i32, i32)) {
         self.present_rect = rect;
+    }
+
+    /// The last presented frame as a jpeg, for savestate thumbnails. Reads the composed
+    /// pixels out of host memory — the buffer the present thread last uploaded — rather
+    /// than off the GPU: vitaGL has no working glReadPixels, and at 240x160 the frame is
+    /// already thumbnail-sized, so nothing has to be scaled either.
+    ///
+    /// Empty before the first frame or if encoding fails; the list UI then draws the
+    /// entry without a thumbnail. Call only while the game is paused, so no worker owns
+    /// the buffer being read.
+    pub fn capture_frame_jpeg(&self) -> Vec<u8> {
+        let (Some(_), Some(soft)) = (self.last_blit, self.soft_renderer.as_ref()) else {
+            return Vec::new();
+        };
+        // present_pixels has already advanced past the buffer that was presented
+        let index = (self.present_pixels + FRAME_BUFS - 1) % FRAME_BUFS;
+        let pixels = unsafe { soft.buf(index) };
+
+        // Pixels are 0xAABBGGRR words, i.e. r,g,b,a bytes in memory
+        let mut rgb = vec![0u8; DISPLAY_PIXEL_COUNT * 3];
+        for (dst, pixel) in rgb.chunks_exact_mut(3).zip(pixels) {
+            dst.copy_from_slice(&pixel.to_le_bytes()[..3]);
+        }
+
+        let mut jpeg = Vec::new();
+        let encoder = jpeg_encoder::Encoder::new(&mut jpeg, 80);
+        if encoder.encode(&rgb, DISPLAY_WIDTH as u16, DISPLAY_HEIGHT as u16, jpeg_encoder::ColorType::Rgb).is_err() {
+            jpeg.clear();
+        }
+        jpeg
     }
 
     /// Re-blit the last rendered frame onto the default framebuffer, so the pause menu

@@ -196,6 +196,7 @@ pub(crate) enum SettingId {
     JoystickAsDpad,
     ShowDebugStatistics,
     Retroachievements,
+    SavestateOnExit,
 }
 
 impl SettingId {
@@ -222,6 +223,13 @@ impl SettingId {
             ),
             SettingId::Controls => Setting::new("Controls", "Custom button mapping to use. Create profiles under Global settings.", SettingValue::List(ListInner::new(0, vec![])), true, SettingGroup::System),
             SettingId::JoystickAsDpad => Setting::new("Joystick as D-Pad", "Use the left analog stick as the D-Pad.", SettingValue::Bool(true), true, SettingGroup::System),
+            SettingId::SavestateOnExit => Setting::new(
+                "Savestate on exit",
+                "Write a savestate when you quit a game, so it can be resumed from the game's page in the browser.",
+                SettingValue::Bool(true),
+                true,
+                SettingGroup::System,
+            ),
             SettingId::ShowDebugStatistics => Setting::new("Show debug statistics", "Show FPS and other debug information while playing.", SettingValue::Bool(true), true, SettingGroup::System),
             SettingId::Retroachievements => Setting::new(
                 "RetroAchievements",
@@ -283,6 +291,10 @@ impl Settings {
 
     pub fn show_debug_stats(&self) -> bool {
         unsafe { self.0[SettingId::ShowDebugStatistics as usize].value.as_bool().unwrap_unchecked() }
+    }
+
+    pub fn savestate_on_exit(&self) -> bool {
+        unsafe { self.0[SettingId::SavestateOnExit as usize].value.as_bool().unwrap_unchecked() }
     }
 
     pub fn retroachievements(&self) -> bool {

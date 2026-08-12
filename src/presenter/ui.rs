@@ -3,7 +3,7 @@
 // settings tabs) behind each rom, and a modal pause menu over the frozen frame.
 use crate::core::gpu::GbaRenderer;
 use crate::presenter::imgui::root::{
-    ImDrawData, ImDrawList_AddRectFilled, ImGuiCol__ImGuiCol_Text, ImFontAtlas_AddFontFromMemoryTTF, ImFontAtlas_GetGlyphRangesDefault, ImFontConfig, ImFontConfig_ImFontConfig, ImGui, ImGuiCol__ImGuiCol_Button,
+    ImDrawData, ImDrawList_AddImage, ImDrawList_AddRect, ImDrawList_AddRectFilled, ImDrawList_AddText, ImGuiCol__ImGuiCol_Text, ImFontAtlas_AddFontFromMemoryTTF, ImFontAtlas_GetGlyphRangesDefault, ImFontConfig, ImFontConfig_ImFontConfig, ImGui, ImGuiCol__ImGuiCol_Button,
     ImGuiCond__ImGuiSetCond_Always, ImGuiItemFlags__ImGuiItemFlags_Disabled, ImGuiNavInput__ImGuiNavInput_Cancel, ImGuiNavInput__ImGuiNavInput_FocusNext,
     ImGuiNavInput__ImGuiNavInput_FocusPrev, ImGuiStyleVar__ImGuiStyleVar_Alpha, ImGuiWindowFlags__ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags__ImGuiWindowFlags_NoBringToFrontOnFocus,
     ImGuiWindowFlags__ImGuiWindowFlags_NoCollapse, ImGuiWindowFlags__ImGuiWindowFlags_NoFocusOnAppearing, ImGuiWindowFlags__ImGuiWindowFlags_NoMove, ImGuiWindowFlags__ImGuiWindowFlags_NoResize,
@@ -11,7 +11,7 @@ use crate::presenter::imgui::root::{
 };
 use crate::global_settings::GlobalSettings;
 use crate::key_bindings::KeyBinding;
-use crate::presenter::{default_key_binding, show_controls_create_settings, show_layout_create_settings, show_retroachievements_settings, PRESENTER_SCREEN_HEIGHT, PRESENTER_SCREEN_WIDTH};
+use crate::presenter::{default_key_binding, show_controls_create_settings, show_layout_create_settings, show_retroachievements_settings, text_input_field, PRESENTER_SCREEN_HEIGHT, PRESENTER_SCREEN_WIDTH};
 use crate::ra_context::RaContext;
 use crate::screen_layout::CustomLayout;
 use crate::settings::{Setting, SettingGroup, SettingValue, SettingsConfig};
@@ -430,6 +430,345 @@ pub fn show_progress(title: &str, progress: usize, total: usize, ui_backend: &mu
     }
 }
 
+/// One frame of the savestate progress dialog, drawn over the frozen game frame while
+/// the main loop waits for the cpu thread to finish a menu-requested save or load.
+pub fn show_savestate_progress(ui_backend: &mut impl UiBackend, renderer: &GbaRenderer, text: impl AsRef<str>, progress: usize) {
+    unsafe {
+        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+        gl::Viewport(0, 0, PRESENTER_SCREEN_WIDTH as _, PRESENTER_SCREEN_HEIGHT as _);
+        gl::ClearColor(0.0, 0.0, 0.0, 1.0);
+        gl::Clear(gl::COLOR_BUFFER_BIT);
+        renderer.blit_main_framebuffer();
+
+        ui_backend.new_frame();
+
+        center_next_window();
+        if ImGui::BeginPopupModal(c"SavestateProgressPopup".as_ptr(), ptr::null_mut(), MODAL_FLAGS as _) {
+            dialog_title(c"Savestate");
+            let text = CString::new(text.as_ref()).unwrap_or_default();
+            centered_text(&text);
+            ImGui::Spacing();
+            const BAR_WIDTH: f32 = 440.0;
+            let avail = ImGui::GetContentRegionAvail().x;
+            if avail > BAR_WIDTH {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - BAR_WIDTH) * 0.5);
+            }
+            let sz = ImVec2 { x: BAR_WIDTH, y: 28.0 };
+            ImGui::ProgressBar(progress as f32 / 100.0, &sz, ptr::null());
+            ImGui::EndPopup();
+        }
+        ImGui::OpenPopup(c"SavestateProgressPopup".as_ptr());
+
+        present_frame(ui_backend);
+    }
+}
+
+/// A savestate file as the list shows it: the decoded thumbnail plus the pre-built
+/// C strings, so nothing is formatted per frame.
+struct SavestateUiEntry {
+    path: PathBuf,
+    label: CString,
+    detail: CString,
+    // Row-spanning selectable id; the visible content is drawlist-drawn on top
+    sel_id: CString,
+    texture: u32,
+    // False for states written by another build: shown so they can be seen and deleted,
+    // but Load is disabled because the field walk would decode into the wrong layout.
+    loadable: bool,
+    // User-given name, empty when never renamed; seeds the rename field.
+    label_text: String,
+}
+
+fn rgb_to_rgba(rgb: &[u8], pixels: usize) -> Vec<u8> {
+    let mut rgba = vec![0u8; pixels * 4];
+    for i in 0..pixels {
+        rgba[i * 4..i * 4 + 3].copy_from_slice(&rgb[i * 3..i * 3 + 3]);
+        rgba[i * 4 + 3] = 0xFF;
+    }
+    rgba
+}
+
+fn decode_screenshot_jpeg(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+    let data = decoder.decode().ok()?;
+    let info = decoder.info()?;
+    if info.pixel_format != jpeg_decoder::PixelFormat::RGB24 {
+        return None;
+    }
+    let pixels = info.width as usize * info.height as usize;
+    Some((info.width as u32, info.height as u32, rgb_to_rgba(&data, pixels)))
+}
+
+/// Decode an embedded screenshot into a GL texture; 0 on any failure (the entry then
+/// renders without a thumbnail).
+unsafe fn create_screenshot_texture(bytes: &[u8]) -> u32 {
+    let Some((width, height, data)) = (match bytes {
+        [0xFF, 0xD8, ..] => decode_screenshot_jpeg(bytes),
+        _ => None,
+    }) else {
+        return 0;
+    };
+    let mut tex = 0;
+    gl::GenTextures(1, &mut tex);
+    gl::BindTexture(gl::TEXTURE_2D, tex);
+    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as _);
+    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as _);
+    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as _);
+    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
+    gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RGBA as _, width as _, height as _, 0, gl::RGBA, gl::UNSIGNED_BYTE, data.as_ptr() as _);
+    gl::BindTexture(gl::TEXTURE_2D, 0);
+    tex
+}
+
+/// Scan `<rom_dir>/savestates/` for this rom's states: the exit-resume slot first, then
+/// the quick slot (the one the hotkey keeps rewriting), then the numbered ones newest
+/// first — most-likely-wanted at the top, which is also where nav lands. Files that don't parse as a savestate of this build are
+/// skipped rather than listed as broken.
+unsafe fn load_savestate_entries(rom_path: &Path) -> Vec<SavestateUiEntry> {
+    use crate::savestate::SlotKind;
+    let mut entries = Vec::new();
+    let Ok(read_dir) = fs::read_dir(crate::savestate::savestates_dir(rom_path)) else {
+        return entries;
+    };
+
+    let mut found = Vec::new();
+    for dir_entry in read_dir.flatten() {
+        let name = dir_entry.file_name().to_string_lossy().into_owned();
+        let Some(kind) = crate::savestate::classify_slot(rom_path, &name) else { continue };
+        found.push((kind, dir_entry.path()));
+    }
+    // Quick slot pinned to the top; numbered descending below it.
+    // Resume-on-launch first, then the hotkey slot, then numbered descending. Grouped by
+    // a tuple rather than folding the rank into the number: any `MAX - num + rank` form
+    // overflows once rank exceeds the smallest slot number, and slots start at 1.
+    found.sort_by_key(|(kind, _)| match kind {
+        SlotKind::Auto => (0u8, 0u32),
+        SlotKind::Quick => (1, 0),
+        SlotKind::Numbered(num) => (2, u32::MAX - num),
+    });
+
+    for (kind, path) in found {
+        let (texture, loadable, note, label_text) = match crate::savestate::peek(&path) {
+            crate::savestate::PeekResult::Ok(meta) => (create_screenshot_texture(&meta.screenshot), true, String::new(), meta.label),
+            crate::savestate::PeekResult::VersionMismatch(version) => (0, false, format!(" - made by a different version (v{version})"), String::new()),
+            crate::savestate::PeekResult::Unreadable => continue,
+        };
+        let metadata = fs::metadata(&path).ok();
+        let modified = metadata
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .map(|time| chrono::DateTime::<chrono::Local>::from(time).format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_default();
+        let size = metadata.map(|m| format!(" - {}", crate::savestate::format_size(m.len()))).unwrap_or_default();
+        let (label, id) = match kind {
+            SlotKind::Auto => ("Resume (saved on exit)".to_string(), "auto".to_string()),
+            SlotKind::Quick => ("Quick savestate".to_string(), "quick".to_string()),
+            SlotKind::Numbered(num) => (format!("Savestate {num}"), num.to_string()),
+        };
+        // A renamed state shows its name; the slot it lives in moves into the detail line
+        let (shown, detail_prefix) = if label_text.is_empty() {
+            (label, String::new())
+        } else {
+            (label_text.clone(), format!("{label} - "))
+        };
+        entries.push(SavestateUiEntry {
+            texture,
+            path,
+            label: CString::new(shown).unwrap(),
+            detail: CString::new(format!("{detail_prefix}{modified}{size}{note}")).unwrap(),
+            sel_id: CString::new(format!("##savestate{id}")).unwrap(),
+            loadable,
+            label_text,
+        });
+    }
+    entries
+}
+
+unsafe fn free_savestate_entries(entries: &mut Vec<SavestateUiEntry>) {
+    for entry in entries.iter() {
+        if entry.texture != 0 {
+            gl::DeleteTextures(1, &entry.texture);
+        }
+    }
+    entries.clear();
+}
+
+enum SavestateUiAction {
+    Create,
+    Overwrite(PathBuf),
+    Load(PathBuf),
+    Delete(PathBuf),
+    Rename(PathBuf, String),
+}
+
+/// Which actions the list can offer. The rom browser has no running emulator behind it,
+/// so it can only start a game from a state — creating or overwriting one needs a
+/// machine to snapshot.
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum SavestateUiMode {
+    InGame,
+    Browser,
+}
+
+/// Full-screen savestate list: thumbnail and name/date per entry, create button on top.
+/// Clicking an entry opens a modal offering Load, Overwrite or Delete.
+unsafe fn render_savestate_overlay(entries: &[SavestateUiEntry], selected: &mut Option<usize>, confirming_delete: &mut bool, renaming: &mut Option<String>, mode: SavestateUiMode) -> Option<SavestateUiAction> {
+    let mut action = None;
+
+    if mode == SavestateUiMode::InGame {
+        if full_width_button(c"Create new savestate") {
+            action = Some(SavestateUiAction::Create);
+        }
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+    }
+
+    if entries.is_empty() {
+        ImGui::Spacing();
+        centered_text(c"No savestates yet");
+    }
+
+    let child_sz = ImVec2 { x: 0.0, y: -ImGui::GetTextLineHeightWithSpacing() };
+    if ImGui::BeginChild(c"##savestate_scroll".as_ptr() as _, &child_sz, false, 0) {
+        // Thumbnails keep the 3:2 GBA aspect
+        const THUMB_W: f32 = 192.0;
+        const THUMB_H: f32 = 128.0;
+        for (i, entry) in entries.iter().enumerate() {
+            // One row-spanning Selectable so the entry is reachable by gamepad/keyboard
+            // nav (a plain widget group never receives nav focus); the thumbnail and
+            // texts are drawlist-drawn over it so no other item competes for
+            // hover/clicks.
+            let origin = ImGui::GetCursorScreenPos();
+            let sel_sz = ImVec2 {
+                x: ImGui::GetContentRegionAvail().x,
+                y: THUMB_H,
+            };
+            if ImGui::Selectable(entry.sel_id.as_ptr(), false, 0, &sel_sz) {
+                *selected = Some(i);
+                // Each dialog opens on its first page, never mid-confirmation or mid-rename
+                *confirming_delete = false;
+                *renaming = None;
+            }
+
+            let dl = ImGui::GetWindowDrawList();
+            if entry.texture != 0 {
+                let thumb_min = origin;
+                let thumb_max = ImVec2 {
+                    x: origin.x + THUMB_W,
+                    y: origin.y + THUMB_H,
+                };
+                let uv0 = ImVec2 { x: 0.0, y: 0.0 };
+                let uv1 = ImVec2 { x: 1.0, y: 1.0 };
+                ImDrawList_AddImage(dl, entry.texture as _, &thumb_min, &thumb_max, &uv0, &uv1, 0xFFFFFFFF);
+                ImDrawList_AddRect(dl, &thumb_min, &thumb_max, 0xFF4D4D4D, 0.0, 0, 1.0);
+            }
+            let line_height = ImGui::GetTextLineHeightWithSpacing();
+            let label_pos = ImVec2 {
+                x: origin.x + THUMB_W + 14.0,
+                y: origin.y + 4.0,
+            };
+            let detail_pos = ImVec2 {
+                x: label_pos.x,
+                y: label_pos.y + line_height * 1.3,
+            };
+            ImDrawList_AddText(dl, &label_pos, 0xFFFFFFFF, entry.label.as_ptr(), ptr::null());
+            ImDrawList_AddText(dl, &detail_pos, 0xFFCCCCCC, entry.detail.as_ptr(), ptr::null());
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+        }
+        nav_scroll_stop(c"##savestate_bottom_stop");
+    }
+    ImGui::EndChild();
+    back_hint();
+
+    // Load-or-delete dialog for the clicked entry
+    if let Some(i) = *selected {
+        let entry = &entries[i];
+        ImGui::OpenPopup(c"SavestateActionPopup".as_ptr());
+        center_next_window();
+        if ImGui::BeginPopupModal(c"SavestateActionPopup".as_ptr(), ptr::null_mut(), MODAL_FLAGS as _) {
+            const BUTTON_WIDTH: f32 = 260.0;
+            if let Some(buf) = renaming {
+                dialog_title(c"Rename savestate");
+                text_input_field(c"Name", buf, crate::savestate::MAX_LABEL_LEN);
+                ImGui::Spacing();
+                if menu_button(c"Save name", BUTTON_WIDTH) {
+                    action = Some(SavestateUiAction::Rename(entry.path.clone(), buf.clone()));
+                    *selected = None;
+                    *renaming = None;
+                    ImGui::CloseCurrentPopup();
+                }
+                if menu_button(c"Cancel", BUTTON_WIDTH) || cancel_pressed() {
+                    *renaming = None;
+                }
+                ImGui::EndPopup();
+                return action;
+            }
+            if *confirming_delete {
+                // Deleting a state is unrecoverable and the button sits in a pad-navigated
+                // list, so it takes a second, explicit press.
+                dialog_title(c"Delete savestate?");
+                centered_text(&entry.label);
+                centered_text(c"This cannot be undone.");
+                ImGui::Spacing();
+                if menu_button(c"Delete", BUTTON_WIDTH) {
+                    action = Some(SavestateUiAction::Delete(entry.path.clone()));
+                    *selected = None;
+                    *confirming_delete = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                if menu_button(c"Cancel", BUTTON_WIDTH) || cancel_pressed() {
+                    *confirming_delete = false;
+                }
+                ImGui::EndPopup();
+                return action;
+            }
+
+            dialog_title(&entry.label);
+            centered_text(&entry.detail);
+            ImGui::Spacing();
+            // A state from another build can be listed and deleted but never loaded
+            if !entry.loadable {
+                ImGui::PushItemFlag(ImGuiItemFlags__ImGuiItemFlags_Disabled as _, true);
+                ImGui::PushStyleVar(ImGuiStyleVar__ImGuiStyleVar_Alpha as _, (*ImGui::GetStyle()).Alpha * 0.5f32);
+            }
+            if menu_button(if mode == SavestateUiMode::Browser { c"Launch from here" } else { c"Load" }, BUTTON_WIDTH) && entry.loadable {
+                action = Some(SavestateUiAction::Load(entry.path.clone()));
+                *selected = None;
+                ImGui::CloseCurrentPopup();
+            }
+            if !entry.loadable {
+                ImGui::PopItemFlag();
+                ImGui::PopStyleVar(1);
+            }
+            // Re-save in place, so a slot can be reused instead of every save adding a
+            // file. Between Load and Delete on purpose: it is the one you reach for after
+            // Load, and it keeps a misnav off Delete's neighbour.
+            if mode == SavestateUiMode::InGame && menu_button(c"Overwrite", BUTTON_WIDTH) {
+                action = Some(SavestateUiAction::Overwrite(entry.path.clone()));
+                *selected = None;
+                ImGui::CloseCurrentPopup();
+            }
+            if entry.loadable && menu_button(c"Rename", BUTTON_WIDTH) {
+                *renaming = Some(entry.label_text.clone());
+            }
+            if menu_button(c"Delete", BUTTON_WIDTH) {
+                *confirming_delete = true;
+            }
+            if menu_button(c"Cancel", BUTTON_WIDTH) || cancel_pressed() {
+                *selected = None;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+    }
+
+    action
+}
+
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum UiPauseMenuReturn {
     Resume,
@@ -440,8 +779,13 @@ pub enum UiPauseMenuReturn {
 /// Blocking pause menu, drawn over the frozen game frame: a modal button list, with the
 /// settings on their own fullscreen overlay and a confirmation before quitting.
 /// `settings_config` is edited in place; the caller copies it into the live emulator.
-pub fn show_pause_menu(ui_backend: &mut impl UiBackend, renderer: &GbaRenderer, settings_config: &mut SettingsConfig) -> UiPauseMenuReturn {
+pub fn show_pause_menu(ui_backend: &mut impl UiBackend, renderer: &GbaRenderer, settings_config: &mut SettingsConfig, rom_path: &Path) -> UiPauseMenuReturn {
     let mut pressed_settings = false;
+    let mut pressed_savestates = false;
+    let mut savestate_entries: Vec<SavestateUiEntry> = Vec::new();
+    let mut savestate_selected: Option<usize> = None;
+    let mut savestate_confirm_delete = false;
+    let mut savestate_renaming: Option<String> = None;
     let mut pressed_quit = false;
     let mut pressed_exit = false;
     let mut return_value = None;
@@ -473,6 +817,13 @@ pub fn show_pause_menu(ui_backend: &mut impl UiBackend, renderer: &GbaRenderer, 
                     overlay_focused = true;
                     ImGui::CloseCurrentPopup();
                 }
+                if menu_button(c"Savestates", BUTTON_WIDTH) {
+                    pressed_savestates = true;
+                    overlay_focused = true;
+                    savestate_selected = None;
+                    savestate_entries = load_savestate_entries(rom_path);
+                    ImGui::CloseCurrentPopup();
+                }
                 if menu_button(c"Quit game", BUTTON_WIDTH) {
                     pressed_quit = true;
                     ImGui::CloseCurrentPopup();
@@ -487,7 +838,11 @@ pub fn show_pause_menu(ui_backend: &mut impl UiBackend, renderer: &GbaRenderer, 
             center_next_window();
             if ImGui::BeginPopupModal(c"QuitPopup".as_ptr(), ptr::null_mut(), MODAL_FLAGS as _) {
                 dialog_title(if pressed_exit { c"Exit emulator?" } else { c"Quit game?" });
-                centered_text(c"Unsaved progress will be lost.");
+                if settings_config.settings.savestate_on_exit() {
+                    centered_text(c"A savestate will be written so you can resume.");
+                } else {
+                    centered_text(c"Unsaved progress will be lost.");
+                }
                 ImGui::Spacing();
                 ImGui::Spacing();
 
@@ -506,6 +861,14 @@ pub fn show_pause_menu(ui_backend: &mut impl UiBackend, renderer: &GbaRenderer, 
                 }
                 ImGui::SameLine(0.0, spacing);
                 if ImGui::Button(c"Yes".as_ptr(), &bsz) {
+                    // Queued before returning: the cpu thread is still parked at its
+                    // vblank hook, and the main loop performs any armed op (showing the
+                    // progress dialog) before it tears the game down.
+                    if settings_config.settings.savestate_on_exit() {
+                        let screenshot = renderer.capture_frame_jpeg();
+                        crate::savestate::op_begin();
+                        crate::savestate::request_save_with_screenshot(crate::savestate::SaveTarget::Auto, screenshot);
+                    }
                     return_value = Some(if pressed_exit { UiPauseMenuReturn::QuitApp } else { UiPauseMenuReturn::QuitToMenu });
                     ImGui::CloseCurrentPopup();
                 }
@@ -535,6 +898,57 @@ pub fn show_pause_menu(ui_backend: &mut impl UiBackend, renderer: &GbaRenderer, 
                         overlay_focused = ImGui::IsWindowFocused(0);
                     }
                     ImGui::End();
+                } else if pressed_savestates {
+                    if begin_fullscreen_overlay(c"##savestates") {
+                        match render_savestate_overlay(&savestate_entries, &mut savestate_selected, &mut savestate_confirm_delete, &mut savestate_renaming, SavestateUiMode::InGame) {
+                            Some(action @ (SavestateUiAction::Create | SavestateUiAction::Overwrite(_))) => {
+                                // Screenshot of the frozen frame behind the menu; the state
+                                // itself is written by the cpu thread at the vblank it is
+                                // parked in. op_begin arms the progress dialog the main
+                                // loop shows meanwhile.
+                                let target = match action {
+                                    SavestateUiAction::Overwrite(path) => crate::savestate::SaveTarget::Path(path),
+                                    _ => crate::savestate::SaveTarget::NewSlot,
+                                };
+                                let screenshot = renderer.capture_frame_jpeg();
+                                crate::savestate::op_begin();
+                                crate::savestate::request_save_with_screenshot(target, screenshot);
+                                return_value = Some(UiPauseMenuReturn::Resume);
+                            }
+                            Some(SavestateUiAction::Load(path)) => match fs::read(&path) {
+                                Ok(data) => {
+                                    crate::savestate::op_begin();
+                                    crate::savestate::request_load(data);
+                                    return_value = Some(UiPauseMenuReturn::Resume);
+                                }
+                                Err(err) => eprintln!("Failed to read savestate {path:?}: {err}"),
+                            },
+                            Some(SavestateUiAction::Delete(path)) => {
+                                if let Err(err) = fs::remove_file(&path) {
+                                    eprintln!("Failed to delete savestate {path:?}: {err}");
+                                }
+                                free_savestate_entries(&mut savestate_entries);
+                                savestate_entries = load_savestate_entries(rom_path);
+                            }
+                            // Header-only rewrite on this thread: no emulator involvement,
+                            // so the list can just be rescanned right away.
+                            Some(SavestateUiAction::Rename(path, name)) => {
+                                if let Err(err) = crate::savestate::relabel_file(&path, &name) {
+                                    eprintln!("Failed to rename savestate {path:?}: {err}");
+                                }
+                                free_savestate_entries(&mut savestate_entries);
+                                savestate_entries = load_savestate_entries(rom_path);
+                            }
+                            None => {}
+                        }
+                        // Close the overlay only when no entry dialog is open
+                        if savestate_selected.is_none() && back_closes_overlay(overlay_focused) {
+                            pressed_savestates = false;
+                            free_savestate_entries(&mut savestate_entries);
+                        }
+                        overlay_focused = ImGui::IsWindowFocused(0);
+                    }
+                    ImGui::End();
                 } else if pressed_quit || pressed_exit {
                     ImGui::OpenPopup(c"QuitPopup".as_ptr());
                 } else {
@@ -545,6 +959,7 @@ pub fn show_pause_menu(ui_backend: &mut impl UiBackend, renderer: &GbaRenderer, 
             present_frame(ui_backend);
 
             if let Some(ret) = return_value {
+                free_savestate_entries(&mut savestate_entries);
                 return ret;
             }
         }
@@ -965,6 +1380,7 @@ unsafe fn render_game_detail_overlay(
     active_tab: &mut usize,
     overlay_focused: &mut bool,
     launch: &mut Option<PathBuf>,
+    open_savestates: &mut bool,
 ) {
     let Some(i) = *detail_game else {
         *overlay_focused = true;
@@ -984,6 +1400,10 @@ unsafe fn render_game_detail_overlay(
 
     if full_width_button(c"Launch game") {
         *launch = Some(games[i].path.clone());
+    }
+    // Resume straight into a state without launching, pausing and navigating first.
+    if full_width_button(c"Launch from savestate") {
+        *open_savestates = true;
     }
     ImGui::Spacing();
 
@@ -1006,13 +1426,26 @@ unsafe fn render_game_detail_overlay(
 
 /// Blocking game browser. Returns the chosen rom path, or None if the window closed.
 /// `settings_config` is edited in place so the launch reflects the on-screen choices.
+/// What the browser hands back: the rom to run, and optionally a savestate to resume it
+/// from (chosen on the game's detail page).
+pub struct MenuLaunch {
+    pub rom: PathBuf,
+    pub savestate: Option<PathBuf>,
+}
+
+impl From<PathBuf> for MenuLaunch {
+    fn from(rom: PathBuf) -> Self {
+        MenuLaunch { rom, savestate: None }
+    }
+}
+
 pub fn show_main_menu(
     rom_dir: &Path,
     settings_config: &mut SettingsConfig,
     global_settings: &mut GlobalSettings,
     ra_context: &mut RaContext,
     ui_backend: &mut impl UiBackend,
-) -> Option<PathBuf> {
+) -> Option<MenuLaunch> {
     unsafe {
         let games = scan_games(rom_dir);
         let mut hovered: Option<usize> = None;
@@ -1020,6 +1453,14 @@ pub fn show_main_menu(
         let mut detail_overlay_focused = true;
         let mut active_tab: usize = 0;
         let mut launch: Option<PathBuf> = None;
+        let mut launch_savestate: Option<PathBuf> = None;
+        let mut open_savestates = false;
+        let mut show_savestates = false;
+        let mut savestate_entries: Vec<SavestateUiEntry> = Vec::new();
+        let mut savestate_selected: Option<usize> = None;
+        let mut savestate_confirm_delete = false;
+        let mut savestate_renaming: Option<String> = None;
+        let mut savestate_overlay_focused = true;
         let mut show_global = false;
         let mut global_overlay_focused = false;
         let mut show_ra = false;
@@ -1046,11 +1487,67 @@ pub fn show_main_menu(
             gl::Clear(gl::COLOR_BUFFER_BIT);
 
             if !ui_backend.new_frame() {
+                free_savestate_entries(&mut savestate_entries);
                 return None;
             }
 
             render_game_list(&games, rom_dir, &mut hovered, &mut detail_game, &mut active_tab, &mut show_global);
-            render_game_detail_overlay(&games, settings_config, &mut detail_game, &mut active_tab, &mut detail_overlay_focused, &mut launch);
+            render_game_detail_overlay(&games, settings_config, &mut detail_game, &mut active_tab, &mut detail_overlay_focused, &mut launch, &mut open_savestates);
+
+            // Edge-triggered: the thumbnails are GL textures, so the list is scanned when
+            // the page opens, not every frame.
+            if open_savestates {
+                open_savestates = false;
+                if let Some(i) = detail_game {
+                    free_savestate_entries(&mut savestate_entries);
+                    savestate_entries = load_savestate_entries(&games[i].path);
+                    savestate_selected = None;
+                    savestate_overlay_focused = true;
+                    show_savestates = true;
+                }
+            }
+
+            if show_savestates {
+                // detail_game is what names the rom; if it closed underneath, so does this
+                match detail_game {
+                    Some(i) => {
+                        if begin_fullscreen_overlay(c"##browsersavestates") {
+                            match render_savestate_overlay(&savestate_entries, &mut savestate_selected, &mut savestate_confirm_delete, &mut savestate_renaming, SavestateUiMode::Browser) {
+                                Some(SavestateUiAction::Load(path)) => {
+                                    launch_savestate = Some(path);
+                                    launch = Some(games[i].path.clone());
+                                }
+                                Some(SavestateUiAction::Delete(path)) => {
+                                    if let Err(err) = fs::remove_file(&path) {
+                                        eprintln!("Failed to delete savestate {path:?}: {err}");
+                                    }
+                                    free_savestate_entries(&mut savestate_entries);
+                                    savestate_entries = load_savestate_entries(&games[i].path);
+                                }
+                                Some(SavestateUiAction::Rename(path, name)) => {
+                                    if let Err(err) = crate::savestate::relabel_file(&path, &name) {
+                                        eprintln!("Failed to rename savestate {path:?}: {err}");
+                                    }
+                                    free_savestate_entries(&mut savestate_entries);
+                                    savestate_entries = load_savestate_entries(&games[i].path);
+                                }
+                                // Create/Overwrite are not offered in Browser mode
+                                _ => {}
+                            }
+                            if savestate_selected.is_none() && back_closes_overlay(savestate_overlay_focused) {
+                                show_savestates = false;
+                                free_savestate_entries(&mut savestate_entries);
+                            }
+                            savestate_overlay_focused = ImGui::IsWindowFocused(0);
+                        }
+                        ImGui::End();
+                    }
+                    None => {
+                        show_savestates = false;
+                        free_savestate_entries(&mut savestate_entries);
+                    }
+                }
+            }
 
             // Only one page is up at a time: a sub-page covers the menu it was opened
             // from, and closing it (Back) returns there rather than all the way out.
@@ -1101,6 +1598,7 @@ pub fn show_main_menu(
             present_frame(ui_backend);
         }
 
-        launch
+        free_savestate_entries(&mut savestate_entries);
+        launch.map(|rom| MenuLaunch { rom, savestate: launch_savestate })
     }
 }

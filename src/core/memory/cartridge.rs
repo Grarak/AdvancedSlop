@@ -2,7 +2,7 @@ use crate::cartridge_io::{CartridgeIo, SaveType};
 use crate::core::emu::Emu;
 use crate::core::memory::regions;
 use crate::logging::debug_println;
-use crate::savestate::{Savestate, SavestateContext};
+use crate::savestate::Savestate;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 // Rom-load progress, published by the cpu thread while streaming the rom into shm and
@@ -13,7 +13,7 @@ pub static ROM_LOAD_DONE: AtomicU32 = AtomicU32::new(0);
 
 // Flash command state machine (Macronix ids like NooDS: 0xC2, device 0x1C 64K / 0x09
 // 128K). Commands arrive as byte writes at 0x0E005555/0x0E002AAA.
-#[derive(Default)]
+#[derive(Default, Savestate)]
 struct FlashState {
     cmd_stage: u8,
     id_mode: bool,
@@ -27,7 +27,7 @@ struct FlashState {
 // commands and data arrive one bit at a time through DMA3 to the top of the rom space.
 // size stays 0 until the first transfer reveals whether commands are 8-bit (0.5KB,
 // 6-bit block address) or 16-bit (8KB, 10-bit block address).
-#[derive(Default)]
+#[derive(Default, Savestate)]
 struct EepromState {
     count: u16,
     cmd: u16,
@@ -39,7 +39,13 @@ struct EepromState {
 // GBA cartridge: memory-mapped rom (copied into shm at boot, served by fastmem/slow
 // path), plus the save backends behind the 0x0E bus window and the EEPROM window at
 // the top of the rom space.
+#[derive(Savestate)]
 pub struct Cartridge {
+    // Rom handle and save-chip contents. Skipped: the save chip persists through the
+    // .sav file, shared by every savestate of the game (same rule as DSVita), so
+    // loading a state never rewrites the player's real save. Only the protocol state
+    // machines below — which can be mid-command at any vblank — travel with the state.
+    #[savestate(skip)]
     pub io: CartridgeIo,
     flash: FlashState,
     eeprom: EepromState,
@@ -61,9 +67,16 @@ impl Cartridge {
     }
 }
 
-impl Savestate for Cartridge {
-    fn savestate(&mut self, _state: &mut SavestateContext) {
-        // TODO(P6): serialize eeprom/flash protocol state + save_buf
+impl Emu {
+    /// The EEPROM size is only known once a transfer reveals it, and detecting it
+    /// resizes the save buffer (which is what the address masking in read/write_save_buf
+    /// keys off). A state taken after detection must put the buffer back to that size,
+    /// or the restored `eeprom.size` masks addresses against the wrong length.
+    pub fn cartridge_savestate_post_load(&mut self) {
+        let size = self.cartridge.eeprom.size as usize;
+        if size != 0 && self.cartridge.io.save_buf.read().unwrap().len() != size {
+            self.cartridge.io.resize_save_buf(size);
+        }
     }
 }
 

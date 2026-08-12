@@ -55,7 +55,11 @@ $ advancedslop [-f <framelimit>] [-a] [-s <savestate>] <rom.gba | rom directory>
 | Start / Select | Start / Select | B / V |
 | Pause menu | Triangle | Escape |
 | Cycle screen layout | Square | F12 |
+| Quick save / load | Right stick up / down | F11 / Shift+F11 |
 | Framelimit | | F1-F9 (100%-500%), F10 uncapped |
+
+Savestates can also be created, loaded and managed from the pause menu, and a game can be
+resumed from a savestate on its page in the browser.
 
 ## Bug reporting
 

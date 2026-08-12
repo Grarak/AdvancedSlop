@@ -9,7 +9,7 @@ use crate::key_bindings::KeyBinding;
 use crate::presenter::ui::{ControlsEditContext, RALoginContext};
 use crate::ra_context::RaContext;
 use crate::screen_layout::CustomLayout;
-use crate::presenter::ui::{show_main_menu, UiBackend};
+use crate::presenter::ui::{show_main_menu, MenuLaunch, UiBackend};
 use crate::presenter::{PresentEvent, PRESENTER_AUDIO_OUT_BUF_SIZE, PRESENTER_AUDIO_OUT_SAMPLE_RATE, PRESENTER_SCREEN_HEIGHT, PRESENTER_SCREEN_WIDTH};
 use crate::settings::{Settings, SettingsConfig};
 use crate::utils::BuildNoHasher;
@@ -24,7 +24,7 @@ use std::mem;
 use std::ops::BitOrAssign;
 use std::ptr;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::slice;
 #[cfg(debug_assertions)]
@@ -204,14 +204,14 @@ impl Presenter {
     /// If the gba_rom arg is a file, launch it directly (CLI/testing path, applying the
     /// CLI framelimit/audio overrides). If it's a directory, show the imgui game browser
     /// rooted there (which edits the persisted settings in place) and return the rom.
-    pub fn present_ui(&mut self, settings_config: &mut SettingsConfig, global_settings: &mut GlobalSettings, ra_context: &mut RaContext) -> Option<PathBuf> {
+    pub fn present_ui(&mut self, settings_config: &mut SettingsConfig, global_settings: &mut GlobalSettings, ra_context: &mut RaContext) -> Option<MenuLaunch> {
         let arg = PathBuf::from(self.arg_matches.get_one::<String>("gba_rom")?);
         if arg.is_dir() {
             show_main_menu(&arg, settings_config, global_settings, ra_context, self)
         } else {
             settings_config.settings.set_framelimit(self.get_framelimit_arg());
             settings_config.settings.set_audio(self.get_audio_arg());
-            Some(arg)
+            Some(arg.into())
         }
     }
 
@@ -230,8 +230,12 @@ impl Presenter {
         self.data_path().join("advancedslop_settings.ini")
     }
 
-    pub fn present_pause(&mut self, renderer: &GbaRenderer, settings_config: &mut SettingsConfig) -> crate::presenter::UiPauseMenuReturn {
-        crate::presenter::ui::show_pause_menu(self, renderer, settings_config)
+    pub fn present_pause(&mut self, renderer: &GbaRenderer, settings_config: &mut SettingsConfig, rom_path: &Path) -> crate::presenter::UiPauseMenuReturn {
+        crate::presenter::ui::show_pause_menu(self, renderer, settings_config, rom_path)
+    }
+
+    pub fn present_savestate_progress(&mut self, renderer: &GbaRenderer, text: impl AsRef<str>, progress: usize) {
+        crate::presenter::ui::show_savestate_progress(self, renderer, text, progress)
     }
 
     pub fn present_progress(&mut self, title: &str, progress: usize, total: usize) {
@@ -257,7 +261,7 @@ impl Presenter {
                     keycode: Some(keyboard::Keycode::Escape),
                     ..
                 } => return PresentEvent::Pause,
-                Event::KeyDown { keycode: Some(code), .. } => {
+                Event::KeyDown { keycode: Some(code), keymod, .. } => {
                     // F1-F9 set the framelimit to 1-9 (100%..500%), F10 uncaps it.
                     let function_keys = [
                         keyboard::Keycode::F1,
@@ -274,8 +278,18 @@ impl Presenter {
                     if let Some(index) = function_keys.iter().position(|&key| key == code) {
                         return PresentEvent::SetFramelimit(if index == 9 { 0 } else { index as u8 + 1 });
                     }
+                    // F11 quick-saves into the overwrite-in-place quick slot, Shift+F11
+                    // loads it back. F1-F10/F12 are taken, so the load side rides a
+                    // modifier rather than displacing an existing binding.
                     if code == keyboard::Keycode::F11 {
-                        crate::savestate::request_save();
+                        return if keymod.intersects(keyboard::Mod::LSHIFTMOD | keyboard::Mod::RSHIFTMOD) {
+                            PresentEvent::QuickLoad
+                        } else {
+                            PresentEvent::QuickSave
+                        };
+                    }
+                    if code == keyboard::Keycode::PrintScreen {
+                        return PresentEvent::Screenshot;
                     }
                     if code == keyboard::Keycode::F12 {
                         return PresentEvent::CycleScreenLayout;
@@ -302,6 +316,12 @@ impl Presenter {
             }
             if st.pause.swap(false, Ordering::Relaxed) {
                 return PresentEvent::Pause;
+            }
+            if st.quick_save.swap(false, Ordering::Relaxed) {
+                return PresentEvent::QuickSave;
+            }
+            if st.quick_load.swap(false, Ordering::Relaxed) {
+                return PresentEvent::QuickLoad;
             }
             let fl = st.pending_framelimit.swap(-1, Ordering::Relaxed);
             if fl >= 0 {
@@ -527,6 +547,21 @@ pub fn show_retroachievements_settings(global_settings: &mut GlobalSettings, log
 pub fn show_controls_create_settings(_: &mut GlobalSettings, _: &mut ControlsEditContext, _: &mut KeyBinding) -> bool {
     unsafe { ImGui::Text(c"Custom controls can only be created on the Vita.".as_ptr()) };
     false
+}
+
+/// Editable text field for the savestate rename dialog. There is a real keyboard here,
+/// so the field is edited in place.
+pub fn text_input_field(label: &CStr, value: &mut String, max_len: usize) {
+    unsafe {
+        let mut buf = vec![0u8; max_len + 1];
+        let len = value.len().min(max_len);
+        buf[..len].copy_from_slice(&value.as_bytes()[..len]);
+        ImGui::PushItemWidth(-1.0);
+        if ImGui::InputText(label.as_ptr(), buf.as_mut_ptr(), buf.len(), 0, None, ptr::null_mut()) {
+            *value = CStr::from_ptr(buf.as_ptr() as _).to_str().unwrap_or("").to_string();
+        }
+        ImGui::PopItemWidth();
+    }
 }
 
 /// The binding a new profile starts from. No Vita buttons exist here, so every key

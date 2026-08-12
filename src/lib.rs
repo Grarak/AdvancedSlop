@@ -41,7 +41,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::Thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{mem, thread};
 
 mod bitset;
@@ -186,6 +186,40 @@ fn execute_jit(jit_asm_arm7: &mut JitAsm) {
         if unlikely(jit_asm_arm7.emu.gpu.renderer.is_quit()) {
             break;
         }
+    }
+}
+
+/// Drive a savestate request queued by the pause menu to completion.
+///
+/// The cpu thread is parked at the vblank hook with the pause still set, so it gets a
+/// single-frame ticket: it consumes the request at that hook, runs one frame and parks
+/// again — the game never resumes behind the dialog. Meanwhile this draws dialog frames
+/// off the status the cpu thread reports, then holds the result briefly.
+fn run_savestate_op(presenter: &mut Presenter, renderer: &GbaRenderer, cpu_thread: &Thread) {
+    renderer.step_paused_frame(cpu_thread);
+
+    // Guard against a cpu thread that quit or died with the request unconsumed: without
+    // it a terminal status that never arrives would wedge the ui in the dialog.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let result_text = loop {
+        match savestate::op_poll() {
+            savestate::OpView::Working { phase, progress } => {
+                if renderer.is_quit() || Instant::now() > deadline {
+                    break "Savestate operation failed".to_string();
+                }
+                presenter.present_savestate_progress(renderer, phase.label(), progress as usize);
+            }
+            savestate::OpView::DoneSave { bytes } => break format!("Savestate saved ({})", savestate::format_size(bytes as u64)),
+            savestate::OpView::DoneLoad { bytes } => break format!("Savestate loaded ({})", savestate::format_size(bytes as u64)),
+            savestate::OpView::Failed => break "Savestate operation failed".to_string(),
+        }
+    };
+    savestate::op_clear();
+
+    // Hold the result (with the file size) on screen before resuming
+    let hold_until = Instant::now() + Duration::from_millis(1200);
+    while Instant::now() < hold_until {
+        presenter.present_savestate_progress(renderer, &result_text, 100);
     }
 }
 
@@ -351,10 +385,19 @@ pub fn actual_main() {
     // Frontend: the game browser + settings menu. Returns the chosen rom; None
     // means the user closed the app. After a game quits back here, the loop repeats.
     'games: loop {
-        let rom_path = presenter.present_ui(&mut settings_config, &mut global_settings, &mut ra_context);
+        let menu_launch = presenter.present_ui(&mut settings_config, &mut global_settings, &mut ra_context);
         // Persist whatever the menu changed, whether it launched a game or closed the app.
         settings_config.flush();
-        let Some(rom_path) = rom_path else { break 'games };
+        let Some(menu_launch) = menu_launch else { break 'games };
+        let rom_path = menu_launch.rom;
+        // "Launch from savestate" on the detail page: seeds this launch the same way -s
+        // seeds the first one, and overrides a -s that hasn't been consumed yet.
+        if let Some(path) = menu_launch.savestate {
+            match std::fs::read(&path) {
+                Ok(data) => pending_savestate = Some(data),
+                Err(err) => eprintln!("Failed to read savestate {path:?}: {err}"),
+            }
+        }
         let settings = settings_config.settings.clone();
         let save_path = PathBuf::from(format!("{}.sav", rom_path.to_string_lossy().trim_end_matches(".gba").trim_end_matches(".GBA")));
         let cartridge_io = match CartridgeIo::new(rom_path, save_path) {
@@ -504,6 +547,23 @@ pub fn actual_main() {
                     settings_config.dirty = true;
                     gba_renderer.set_present_rect(screen_layout::rect_with_custom(settings_config.settings.screen_layout(), &global_settings.custom_layouts));
                 }
+                // Hotkey saves capture the presented frame here, on the render thread
+                // that owns the pixel buffer, so a quick-save gets a thumbnail like a
+                // menu-created one. The cpu thread performs the save at its next vblank.
+                PresentEvent::QuickSave => {
+                    let screenshot = gba_renderer.capture_frame_jpeg();
+                    savestate::request_save_with_screenshot(savestate::SaveTarget::Quick, screenshot);
+                }
+                PresentEvent::QuickLoad => savestate::request_load_quick(),
+                PresentEvent::Screenshot => {
+                    let rom_path = emu_unsafe.get_mut().cartridge.io.file_path.clone();
+                    match savestate::write_screenshot(&rom_path, &gba_renderer.capture_frame_jpeg()) {
+                        Ok(path) => {
+                            info_println!("Screenshot written to {path:?}");
+                        }
+                        Err(err) => eprintln!("Failed to write screenshot: {err}"),
+                    }
+                }
                 PresentEvent::Quit => {
                     game_end = GameEnd::QuitApp;
                     break 'game;
@@ -513,11 +573,15 @@ pub fn actual_main() {
                     // draw the pause menu over the last frame.
                     let renderer = unsafe { (gba_renderer_ptr as *const GbaRenderer).as_ref_unchecked() };
                     renderer.set_pause(true);
-                    let ret = presenter.present_pause(renderer, &mut settings_config);
+                    let rom_path = emu_unsafe.get_mut().cartridge.io.file_path.clone();
+                    let ret = presenter.present_pause(renderer, &mut settings_config, &rom_path);
                     // The cpu thread is still parked, so handing it the menu's settings is
                     // safe up until the unpark below.
                     emu_unsafe.get_mut().settings = settings_config.settings.clone();
                     gba_renderer.set_present_rect(screen_layout::rect_with_custom(settings_config.settings.screen_layout(), &global_settings.custom_layouts));
+                    if savestate::op_active() {
+                        run_savestate_op(&mut presenter, renderer, cpu_thread.thread());
+                    }
                     renderer.set_pause(false);
                     cpu_thread.thread().unpark();
                     match ret {

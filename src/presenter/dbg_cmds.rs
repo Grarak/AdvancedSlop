@@ -4,7 +4,7 @@
 //
 // Newline/broadcast-delimited text commands:
 //   press/release <btn> | buttons [<btn>...] |
-//   framelimit <0..9> | pause | savestate | inst-log | quit
+//   framelimit <0..9> | pause | savestate | loadstate | inst-log | quit
 // btn: a b up down left right start select l r. inst-log arms --inst-log-lazy
 // capture. Replies "ok" or "err: ...".
 
@@ -17,6 +17,8 @@ pub struct DebugState {
     pub pending_framelimit: AtomicI32, // -1 = none, else 0..=9
     pub pause: AtomicBool,
     pub quit: AtomicBool,
+    pub quick_save: AtomicBool,
+    pub quick_load: AtomicBool,
 }
 
 impl DebugState {
@@ -26,6 +28,8 @@ impl DebugState {
             pending_framelimit: AtomicI32::new(-1),
             pause: AtomicBool::new(false),
             quit: AtomicBool::new(false),
+            quick_save: AtomicBool::new(false),
+            quick_load: AtomicBool::new(false),
         }
     }
 }
@@ -71,8 +75,14 @@ pub fn handle_debug_cmd(state: &DebugState, line: &str) -> String {
             state.pause.store(true, Ordering::Relaxed);
             "ok".to_owned()
         }
+        // Handed to poll_event rather than straight to the savestate module: the save
+        // needs a screenshot of the presented frame, which only the render thread may read.
         "savestate" => {
-            crate::savestate::request_save();
+            state.quick_save.store(true, Ordering::Relaxed);
+            "ok".to_owned()
+        }
+        "loadstate" => {
+            state.quick_load.store(true, Ordering::Relaxed);
             "ok".to_owned()
         }
         "inst-log" => {

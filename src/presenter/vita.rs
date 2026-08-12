@@ -10,12 +10,12 @@ use crate::key_bindings::KeyBinding;
 use crate::presenter::ui::{ControlsEditContext, RALoginContext};
 use crate::ra_context::RaContext;
 use crate::screen_layout::CustomLayout;
-use crate::presenter::ui::{show_main_menu, UiBackend};
+use crate::presenter::ui::{show_main_menu, MenuLaunch, UiBackend};
 use crate::presenter::{PresentEvent, PRESENTER_AUDIO_OUT_BUF_SIZE, PRESENTER_AUDIO_OUT_SAMPLE_RATE, PRESENTER_SCREEN_HEIGHT, PRESENTER_SCREEN_WIDTH};
 use crate::settings::{Settings, SettingsConfig};
 use gl::types::GLuint;
 use std::ffi::CString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::{mem, ptr};
 use vita_gl::SharkOpt;
@@ -78,6 +78,9 @@ pub struct Presenter {
     presenter_audio_out: PresenterAudioOut,
     keymap: u32,
     prev_buttons: u32,
+    // Right-stick hotkey edges (quick save/load)
+    prev_right_stick_up: bool,
+    prev_right_stick_down: bool,
 }
 
 impl Presenter {
@@ -121,6 +124,8 @@ impl Presenter {
                 presenter_audio_out: PresenterAudioOut::new(),
                 keymap: 0xFFFFFFFF,
                 prev_buttons: 0,
+                prev_right_stick_up: false,
+                prev_right_stick_down: false,
             };
             crate::presenter::ui::init_ui(&mut instance);
             Some(instance)
@@ -164,7 +169,7 @@ impl Presenter {
     }
 
     /// Show the imgui game browser rooted at ux0:data/advancedslop and return the chosen rom.
-    pub fn present_ui(&mut self, settings_config: &mut SettingsConfig, global_settings: &mut GlobalSettings, ra_context: &mut RaContext) -> Option<PathBuf> {
+    pub fn present_ui(&mut self, settings_config: &mut SettingsConfig, global_settings: &mut GlobalSettings, ra_context: &mut RaContext) -> Option<MenuLaunch> {
         // get_rom_path shows the "no rom" dialog and returns None when the folder is empty
         self.get_rom_path()?;
         show_main_menu(std::path::Path::new(ROM_PATH), settings_config, global_settings, ra_context, self)
@@ -179,8 +184,12 @@ impl Presenter {
         self.data_path().join("settings.ini")
     }
 
-    pub fn present_pause(&mut self, renderer: &GbaRenderer, settings_config: &mut SettingsConfig) -> crate::presenter::UiPauseMenuReturn {
-        crate::presenter::ui::show_pause_menu(self, renderer, settings_config)
+    pub fn present_pause(&mut self, renderer: &GbaRenderer, settings_config: &mut SettingsConfig, rom_path: &Path) -> crate::presenter::UiPauseMenuReturn {
+        crate::presenter::ui::show_pause_menu(self, renderer, settings_config, rom_path)
+    }
+
+    pub fn present_savestate_progress(&mut self, renderer: &GbaRenderer, text: impl AsRef<str>, progress: usize) {
+        crate::presenter::ui::show_savestate_progress(self, renderer, text, progress)
     }
 
     pub fn present_progress(&mut self, title: &str, progress: usize, total: usize) {
@@ -214,6 +223,25 @@ impl Presenter {
         }
         if square_edge {
             return PresentEvent::CycleScreenLayout;
+        }
+
+        // Quick save/load on the right stick, edge-triggered: every button and the left
+        // stick already carry guest input, and the GBA has no second stick, so this is
+        // the one input that cannot collide with the game. (When the custom-binding path
+        // reaches poll_event, these should become configurable like the rest.)
+        const STICK_THRESHOLD: i32 = 64;
+        let ry = pressed.ry as i32 - 128;
+        let stick_up = ry < -STICK_THRESHOLD;
+        let stick_down = ry > STICK_THRESHOLD;
+        let stick_up_edge = stick_up && !self.prev_right_stick_up;
+        let stick_down_edge = stick_down && !self.prev_right_stick_down;
+        self.prev_right_stick_up = stick_up;
+        self.prev_right_stick_down = stick_down;
+        if stick_up_edge {
+            return PresentEvent::QuickSave;
+        }
+        if stick_down_edge {
+            return PresentEvent::QuickLoad;
         }
 
         self.keymap = 0xFFFFFFFF;
@@ -428,6 +456,17 @@ pub fn default_key_binding() -> KeyBinding {
 
 /// One settings row: a fixed-width button showing `value` (tapping it opens the
 /// on-screen keyboard) with `label` to its right.
+/// Editable text field for the savestate rename dialog. The Vita has no keyboard, so the
+/// field is a button that opens the system IME (same shape as the profile-name field).
+pub fn text_input_field(label: &core::ffi::CStr, value: &mut String, max_len: usize) {
+    unsafe {
+        let shown = CString::new(if value.is_empty() { "(unnamed)" } else { value.as_str() }).unwrap_or_default();
+        if layout_field_button(label.to_str().unwrap_or(""), &shown) {
+            *value = dialog_input("Savestate name", value, SCE_IME_TYPE_BASIC_LATIN, SCE_IME_DIALOG_TEXTBOX_MODE_DEFAULT, max_len as u32);
+        }
+    }
+}
+
 unsafe fn layout_field_button(label: &str, value: &core::ffi::CStr) -> bool {
     let c_label = CString::from_str(label).unwrap();
     ImGui::PushID(c_label.as_ptr());
