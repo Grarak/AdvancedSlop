@@ -186,8 +186,7 @@ impl Emu {
             offset += zeros + 1;
         }
 
-        let cycle_count = self.cm.cycle_count;
-        if likely(cycle_count < self.cm.next_event_cycle) {
+        if likely(self.cm.cycle_count < self.cm.next_event_cycle) {
             return false;
         }
 
@@ -200,6 +199,14 @@ impl Emu {
         // is due.
         self.cm.next_event_cycle = u32::MAX;
         loop {
+            // Read per round instead of hoisting out of the loop: a handler can replace
+            // the whole scheduler under this scan — the vblank hook is where savestate
+            // loads are applied, and cycle_count is a free-running absolute counter, so
+            // the restored clock bears no relation to this session's. Judged against a
+            // hoisted (pre-load) count, every restored event reads as due and the
+            // re-scan grinds the entire grid forward to catch up; the apu sample event
+            // parks the cpu thread on a full queue while doing it, so it never ends.
+            let cycle_count = self.cm.cycle_count;
             let mut best_index = usize::MAX;
             let mut best_cycle = u32::MAX;
             let mut active_events = self.cm.active_events;
@@ -242,7 +249,9 @@ impl Emu {
             }
         }
 
-        if unlikely(cycle_count > 0x7FFFFFFF) {
+        // Re-read rather than reusing the local: a savestate load in a handler above
+        // swapped the clock out.
+        if unlikely(self.cm.cycle_count > 0x7FFFFFFF) {
             self.cm_on_overflow_event();
         }
         true
