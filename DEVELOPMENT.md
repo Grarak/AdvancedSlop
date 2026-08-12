@@ -38,12 +38,35 @@ listed below.
   saturating subtraction (a past due underflowed it — abort on release-debug, a never-firing
   event on release). GPU scanline events still reschedule dispatch-relative; convert them the
   same way if a vblank-vs-timer sync bug ever surfaces.
+- **The dispatch loop reads `cycle_count` per round, never hoisted.** A handler can replace
+  the whole scheduler under the scan: the vblank hook is where savestate loads and rewind
+  restores are applied, and `cycle_count` is a free-running absolute counter, so the restored
+  clock bears no relation to the running session's. Judged against a hoisted (pre-load) count,
+  every restored event reads as due, and the re-scan grinds the entire grid forward to catch
+  up — with the apu sample event parking the cpu thread on a full queue while it does, so it
+  never ends. A state taken half a rebase period earlier is enough to hang the emulator.
 - **A forced scheduler run must not invent guest time.** `cpu_check_for_interrupt`'s
   saturation of `accumulated_cycles` (the §5.3 fix) saves the real count in
   `pre_force_cycles`; every consumer restores it through `take_real_accumulated`. Without the
   restore, ARM7-HLE mode converted the phantom quantum straight into guest time on every irq
   re-enable (`run_scheduler::<true>` has no min() against a real ARM7 slice) and inflated the
   clock enough to trip SDK timeouts.
+
+### Savestate / rewind
+- **Guest state is only ever restored at one point in the frame: the vblank hook at
+  `v_count == VISIBLE_LINES`** (gpu.rs, `gpu_on_scanline308_event`). Three things make that
+  the only safe point, and a restore moved anywhere else breaks at least one of them: cm
+  events are dispatched between jit execute calls (`execute_jit`), so no compiled frame is on
+  the stack when the jit is invalidated; every gpu event has just been rescheduled, so the
+  restored scheduler is consistent; and it sits right after `on_frame_finish` handed the
+  frame over, so the renderer pipeline lines up. The pause menu parks the cpu thread at this
+  same hook, which is why a menu-driven save/load needs only a single-frame ticket
+  (`step_paused_frame`) rather than resuming the game.
+- **One field walk drives both directions** (`SavestateContext`), so save and load can never
+  drift apart; `is_load_successful` requires the load to consume the file exactly. Anything
+  host-derived — mmu tables, compiled blocks, renderer dirty bits — is *not* in the walk and
+  must be re-derived after it (`savestate_post_load`), or it describes memory that has
+  already changed. See §5.10 for how much of that re-derivation rewind can skip, and why.
 
 ### Guest state conventions
 - **`regs.pc` and every branch target carry the thumb bit in bit 0** at all
@@ -452,6 +475,40 @@ Lesson: **any HLE routine whose real-hardware counterpart writes VRAM/palette mu
 downstream as a rendering artifact, which sends you hunting in the wrong subsystem. The
 "re-render the dumped state offline and compare to the reference" trick is the fastest way to
 partition a rendering bug into *data* vs *renderer*.
+
+### 5.10 `jit.init()` costs 11 ms, and almost all of it is the rom tables
+Rewind restores a state every frame while the input is held, and each restore has to drop
+compiled blocks (§5.1: the restored RAM may no longer contain the code a block was compiled
+from, and the jit's SMC tracking only watches *guest* writes, not our restores). Reusing
+`jit.init()` for that measured **11.1 ms per restore on the pi** — 66% of a frame budget —
+against 123 µs for the state walk itself. It still held 60 fps, which is exactly why it
+needed measuring rather than eyeballing: the headroom was gone and the Vita's A9 would have
+fallen off a cliff.
+
+`init` refills tables sized for the whole address space, and the rom-keyed ones dominate:
+`JitEntries.rom` is `ROM_SIZE / 2` pointers (**64 MB**) and `JitExecCounts.rom` is
+`ROM_SIZE / 2` bytes (**16 MB**). ~80 MB of memset per call. The ewram/iwram tables together
+are under 1 MB.
+
+The fix is `JitMemory::invalidate_ram_blocks()`: the same shape as the `invalidate_block`
+SMC path (clear entries, live ranges, hotness counts) applied to all of ewram/iwram, and
+**nothing else**. 11.1 ms → 120 µs.
+
+Two invariants make it sound, and both must hold for any future caller:
+- **The rom cannot change under a restore.** It lies outside `SAVESTATE_SHM_RANGE`, is
+  written once by `cartridge_load_rom_into_shm`, and the rewind ring is cleared on game
+  change and on a savestate load. So rom-derived blocks stay valid and their tables need no
+  refill. (`create_jit_blocks!` already documents rom as "immutable and large".)
+- **Do not touch the code allocator.** `init` also resets `arm7_data`, which lets future
+  compiles overwrite existing code — fine when every entry is being cleared, fatal if rom
+  entries survive and keep pointing at it. Orphaned RAM blocks are reclaimed by
+  `reset_blocks` exactly as after a normal SMC invalidation. For the same reason the
+  per-page `guest_inst_*` metadata is left alone: it is keyed by *host* code page, not guest
+  address, and the allocator owns its lifetime.
+
+`JitMemoryMap` holds pointers *into* the entry/count arrays, so filling them in place needs
+no rebuild. The savestate file-load path deliberately still uses the full `init` — 11 ms once
+is invisible, and it rebuilds the mmu anyway.
 
 ---
 
