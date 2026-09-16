@@ -2,7 +2,7 @@
 
 [![Rust](https://github.com/Grarak/AdvancedSlop/actions/workflows/rust.yml/badge.svg)](https://github.com/Grarak/AdvancedSlop/actions/workflows/rust.yml)
 
-Fast GBA Emulator for ARM32/PSVita
+Fast GBA Emulator for PSVita
 
 ## Status
 
@@ -18,11 +18,8 @@ Most games run, with these caveats:
     - Games that rewrite VRAM or the palette mid-frame (e.g. for gradients) will not
       render correctly
 - Custom control profiles can be created in the settings, but are not applied in game yet
-- The PS Vita build is still being tested on hardware, Linux armhf is the most tested target
 
 ## Installation/Setup
-
-### Vita
 
 - Grab the latest vpk from [releases](https://github.com/Grarak/AdvancedSlop/releases)
 - Install `libshacccg.suprx`, follow
@@ -30,34 +27,21 @@ Most games run, with these caveats:
 - Install `kubridge.skprx` version >= 0.3.1 from https://github.com/bythos14/kubridge/releases
     - Make sure this plugin is in the `*KERNEL` section, otherwise the app might crash upon opening
     - If you have the wrong version installed, the app will either crash or will not be able to launch any games
-- It's strongly recommended to overclock your Vita to 500MHz
 - Create the folder `ux0:data/advancedslop` and put your roms there
     - They must have the `.gba` file extension
 
-### Linux
+## Controls
 
-```bash
-$ advancedslop [-f <framelimit>] [-a] [-s <savestate>] <rom.gba | rom directory>
-```
-
-- `-f` sets the framelimit: `0` uncapped, `1`-`9` for 100%, 125%, 150%, 175%, 200%, 250%, 300%, 400%, 500%
-- `-a` enables audio
-- `-s` continues from a savestate file
-- Passing a directory opens the game browser
-
-### Controls
-
-| | Vita | Linux |
-|---|---|---|
-| D-Pad | D-Pad / left stick | W A S D |
-| A / B | Circle / Cross | K / J |
-| L / R | L / R | 8 / 9 |
-| Start / Select | Start / Select | B / V |
-| Pause menu | Triangle | Escape |
-| Cycle screen layout | Square | F12 |
-| Quick save / load | Right stick up / down | F11 / Shift+F11 |
-| Rewind (hold, enable in settings) | Right stick left | Backspace |
-| Framelimit | | F1-F9 (100%-500%), F10 uncapped |
+| | Button |
+|---|---|
+| D-Pad | D-Pad / left stick |
+| A / B | Circle / Cross |
+| L / R | L / R |
+| Start / Select | Start / Select |
+| Pause menu | Triangle |
+| Cycle screen layout | Square |
+| Quick save / load | Right stick up / down |
+| Rewind (hold, enable in settings) | Right stick left |
 
 Savestates can also be created, loaded and managed from the pause menu, and a game can be
 resumed from a savestate on its page in the browser.
@@ -109,8 +93,7 @@ The `tools/` scripts source `.env` automatically. To use it for cargo builds:
 $ set -a; . ./.env; set +a
 $ cargo build --target thumbv7neon-unknown-linux-gnueabihf --release
 ```
-`.env` is gitignored — it's your machine-specific setup. Development background (JIT/interpreter
-invariants, debugging playbook, renderer design) lives in `DEVELOPMENT.md`.
+`.env` is gitignored — it's your machine-specific setup.
 
 ### Vita
 - Install [Vitasdk](https://vitasdk.org/)
@@ -128,6 +111,8 @@ $ RUSTC=<path to compiled rustc> LIBCLANG_PATH=<path to llvm-18 library> RUSTFLA
 ```
 
 The toolchain is also pinned to an older rust nightly (see `rust-toolchain.toml`), the last one built against llvm-21 — newer llvm versions cause performance regressions.
+
+Development background (JIT/interpreter invariants, debugging playbook, renderer design) lives in `DEVELOPMENT.md`.
 
 ## Credits
 
