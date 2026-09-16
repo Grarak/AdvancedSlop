@@ -34,7 +34,8 @@ silently skip the recompile — see DEVELOPMENT.md §4 pitfalls).
 | Press a key | `tools/pi_key.sh <xkb-key> [hold_ms]` |
 | Check alive | `ssh $ADVANCEDSLOP_PI_HOST 'pgrep -x <binary-name>'` |
 
-Keyboard map: WASD = dpad, K = A, J = B, B = Start, V = Select, 8/9 = L/R.
+Default keyboard map (the "Default" controls profile): WASD = dpad, K = A, J = B, B = Start,
+V = Select, 8/9 = L/R, Escape = pause menu, F12 = next screen layout.
 
 **Debug command port** (debug/release-debug builds) — the headless control channel; needs no
 wayland virtual keyboard (so it works even where `wtype`/`pi_key.sh` is absent). Launch with
@@ -42,6 +43,10 @@ wayland virtual keyboard (so it works even where `wtype`/`pi_key.sh` is absent).
 e.g. `printf 'buttons a\n' | nc -q0 127.0.0.1 5555`:
 - `press/release <btn>` | `buttons [<btn>...]` (exact held set) — btn: `a b up down left
   right start select l r`. A held button = held on the GBA.
+- `key <sdl key name> <down|up>` (e.g. `key Escape down`) | `text <string>` — push real SDL
+  keyboard / text-input events, so they go through the active controls profile (and type into
+  imgui text fields) like a physical keyboard. `press`/`buttons` bypass the profile. Send `down`
+  and `up` as separate commands with a sleep between: both in one poll are never seen held.
 - `framelimit <0..9>` (0 = uncapped) | `pause` (open the pause menu) | `savestate` (quick-save
   at vblank) | `inst-log` (arm a `--inst-log-lazy` capture) | `quit`.
 

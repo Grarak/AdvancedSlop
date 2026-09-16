@@ -66,15 +66,20 @@ impl GlobalSettings {
         })
     }
 
+    /// The profile at `index` of the Controls setting: 0 is the built-in default, then the
+    /// custom profiles in order. An index past the end (a profile deleted since the
+    /// setting was chosen) falls back to the default rather than leaving the pad dead.
     pub fn get_control(&self, index: usize) -> &KeyBinding {
-        if index == 0 {
-            &self.default_control
-        } else {
-            &self.custom_controls[index - 1]
+        match index.checked_sub(1) {
+            Some(i) => self.custom_controls.get(i).unwrap_or(&self.default_control),
+            None => &self.default_control,
         }
     }
 
     pub fn add_custom_controls(&mut self, binding: KeyBinding) -> bool {
+        if binding.name == self.default_control.name {
+            return false;
+        }
         match self.custom_controls.iter().find(|b| b.name == binding.name) {
             None => {
                 self.custom_controls.push(binding);

@@ -6,7 +6,7 @@ use crate::presenter::imgui::root::{
     ImDrawData, ImGui, ImGuiCol__ImGuiCol_Text, ImGui_ImplVitaGL_GamepadUsage, ImGui_ImplVitaGL_Init, ImGui_ImplVitaGL_MouseStickUsage, ImGui_ImplVitaGL_NewFrame,
     ImGui_ImplVitaGL_RenderDrawData, ImGui_ImplVitaGL_TouchUsage, ImVec2,
 };
-use crate::key_bindings::KeyBinding;
+use crate::key_bindings::{Hotkey, KeyBinding, KEY_CODES, NUM_HOTKEYS, NUM_KEYS};
 use crate::presenter::ui::{ControlsEditContext, RALoginContext};
 use crate::ra_context::RaContext;
 use crate::screen_layout::CustomLayout;
@@ -34,19 +34,6 @@ pub const LOG_FILE: &str = "ux0:data/advancedslop/log/log.txt";
 // #[link(name = "SceRazorHud_stub", kind = "static", modifiers = "+whole-archive")]
 // #[link(name = "ScePerf_stub", kind = "static", modifiers = "+whole-archive")]
 extern "C" {}
-
-const KEY_CODE_MAPPING: [(SceCtrlButtons, Keycode); 10] = [
-    (SCE_CTRL_UP, Keycode::Up),
-    (SCE_CTRL_DOWN, Keycode::Down),
-    (SCE_CTRL_LEFT, Keycode::Left),
-    (SCE_CTRL_RIGHT, Keycode::Right),
-    (SCE_CTRL_START, Keycode::Start),
-    (SCE_CTRL_SELECT, Keycode::Select),
-    (SCE_CTRL_CIRCLE, Keycode::A),
-    (SCE_CTRL_CROSS, Keycode::B),
-    (SCE_CTRL_LTRIGGER, Keycode::TriggerL),
-    (SCE_CTRL_RTRIGGER, Keycode::TriggerR),
-];
 
 #[derive(Clone)]
 pub struct PresenterAudioOut {
@@ -77,6 +64,9 @@ unsafe impl Send for PresenterAudioOut {}
 pub struct Presenter {
     presenter_audio_out: PresenterAudioOut,
     keymap: u32,
+    // The active controls profile's SCE_CTRL_* bits, in KEY_NAMES / Hotkey order.
+    key_mapping: [u32; NUM_KEYS],
+    hotkey_mapping: [u32; NUM_HOTKEYS],
     prev_buttons: u32,
     // Right-stick hotkey edges (quick save/load)
     prev_right_stick_up: bool,
@@ -123,6 +113,8 @@ impl Presenter {
             let mut instance = Presenter {
                 presenter_audio_out: PresenterAudioOut::new(),
                 keymap: 0xFFFFFFFF,
+                key_mapping: DEFAULT_KEY_MAPPING,
+                hotkey_mapping: DEFAULT_HOTKEY_MAPPING,
                 prev_buttons: 0,
                 prev_right_stick_up: false,
                 prev_right_stick_down: false,
@@ -208,27 +200,40 @@ impl Presenter {
         None
     }
 
-    pub fn poll_event(&mut self, _: &Settings) -> PresentEvent {
+    /// Switch to a controls profile; takes effect from the next poll.
+    pub fn set_key_mapping(&mut self, binding: &KeyBinding) {
+        self.key_mapping = binding.buttons;
+        self.hotkey_mapping = binding.hotkeys;
+    }
+
+    pub fn poll_event(&mut self, settings: &Settings) -> PresentEvent {
         let mut pressed: SceCtrlData = unsafe { mem::zeroed() };
         unsafe { sceCtrlPeekBufferPositive(0, &mut pressed, 1) };
 
-        // Triangle and Square are unmapped as GBA keys, so they serve as hotkeys,
-        // edge-triggered: Triangle opens the pause menu, Square cycles the screen layout.
-        let edge = |button: SceCtrlButtons| pressed.buttons & button != 0 && self.prev_buttons & button == 0;
-        let triangle_edge = edge(SCE_CTRL_TRIANGLE);
-        let square_edge = edge(SCE_CTRL_SQUARE);
+        // A binding is held when all of its bits are, so a hand-edited ini profile can bind
+        // a button combination; 0 is unbound and never fires.
+        let held = |bits: u32, buttons: u32| bits != 0 && buttons & bits == bits;
+        let prev_buttons = self.prev_buttons;
         self.prev_buttons = pressed.buttons;
-        if triangle_edge {
-            return PresentEvent::Pause;
-        }
-        if square_edge {
-            return PresentEvent::CycleScreenLayout;
+
+        // Hotkeys are edge-triggered. The default profile puts them on Triangle and
+        // Square, which no GBA key uses.
+        const HOTKEY_EVENTS: [(Hotkey, PresentEvent); NUM_HOTKEYS] = [
+            (Hotkey::Pause, PresentEvent::Pause),
+            (Hotkey::NextLayout, PresentEvent::CycleScreenLayout { forward: true }),
+            (Hotkey::PreviousLayout, PresentEvent::CycleScreenLayout { forward: false }),
+        ];
+        for (hotkey, event) in HOTKEY_EVENTS {
+            let bits = self.hotkey_mapping[hotkey as usize];
+            if held(bits, pressed.buttons) && !held(bits, prev_buttons) {
+                return event;
+            }
         }
 
         // Quick save/load on the right stick, edge-triggered: every button and the left
         // stick already carry guest input, and the GBA has no second stick, so this is
-        // the one input that cannot collide with the game. (When the custom-binding path
-        // reaches poll_event, these should become configurable like the rest.)
+        // the one input that cannot collide with the game. These are not part of a
+        // controls profile.
         const STICK_THRESHOLD: i32 = 64;
         // Rewind is a hold, so it drives an atomic the emulation thread samples rather
         // than an event; the stick's other axis carries the save/load edges below.
@@ -248,23 +253,25 @@ impl Presenter {
         }
 
         self.keymap = 0xFFFFFFFF;
-        for (button, keycode) in KEY_CODE_MAPPING {
-            if pressed.buttons & button != 0 {
+        for (bits, keycode) in self.key_mapping.into_iter().zip(KEY_CODES) {
+            if held(bits, pressed.buttons) {
                 self.keymap &= !(1 << keycode as u8);
             }
         }
 
         // Left stick as dpad
-        let (lx, ly) = (pressed.lx as i32 - 128, pressed.ly as i32 - 128);
-        if lx < -64 {
-            self.keymap &= !(1 << Keycode::Left as u8);
-        } else if lx > 64 {
-            self.keymap &= !(1 << Keycode::Right as u8);
-        }
-        if ly < -64 {
-            self.keymap &= !(1 << Keycode::Up as u8);
-        } else if ly > 64 {
-            self.keymap &= !(1 << Keycode::Down as u8);
+        if settings.joystick_as_dpad() {
+            let (lx, ly) = (pressed.lx as i32 - 128, pressed.ly as i32 - 128);
+            if lx < -64 {
+                self.keymap &= !(1 << Keycode::Left as u8);
+            } else if lx > 64 {
+                self.keymap &= !(1 << Keycode::Right as u8);
+            }
+            if ly < -64 {
+                self.keymap &= !(1 << Keycode::Up as u8);
+            } else if ly > 64 {
+                self.keymap &= !(1 << Keycode::Down as u8);
+            }
         }
 
         PresentEvent::Inputs { keymap: self.keymap }
@@ -430,8 +437,8 @@ const BINDABLE_BUTTONS: [(&core::ffi::CStr, u32); 12] = [
     (c"Select", SCE_CTRL_SELECT),
 ];
 
-/// Default mapping in KEY_NAMES order, matching KEY_CODE_MAPPING above.
-const DEFAULT_KEY_MAPPING: [u32; crate::key_bindings::NUM_KEYS] = [
+/// Default mapping in KEY_NAMES order.
+const DEFAULT_KEY_MAPPING: [u32; NUM_KEYS] = [
     SCE_CTRL_CIRCLE,   // A
     SCE_CTRL_CROSS,    // B
     SCE_CTRL_RIGHT,    // Right
@@ -444,9 +451,9 @@ const DEFAULT_KEY_MAPPING: [u32; crate::key_bindings::NUM_KEYS] = [
     SCE_CTRL_START,    // Start
 ];
 
-/// Defaults in Hotkey order. Square already cycles the layout forward and Triangle
-/// opens the pause menu (see poll_event); stepping backwards has no built-in button.
-const DEFAULT_HOTKEY_MAPPING: [u32; crate::key_bindings::NUM_HOTKEYS] = [0, SCE_CTRL_SQUARE, SCE_CTRL_TRIANGLE];
+/// Defaults in Hotkey order: Square cycles the layout forward and Triangle opens the
+/// pause menu; stepping backwards has no default button.
+const DEFAULT_HOTKEY_MAPPING: [u32; NUM_HOTKEYS] = [0, SCE_CTRL_SQUARE, SCE_CTRL_TRIANGLE];
 
 /// A fresh controls profile seeded with the default mapping.
 pub fn default_key_binding() -> KeyBinding {
@@ -481,93 +488,14 @@ unsafe fn layout_field_button(label: &str, value: &core::ffi::CStr) -> bool {
     clicked
 }
 
-/// One binding row: the key's name, and a combo of every bindable Vita button.
-unsafe fn binding_button_row(id: i32, label: &str, value: &mut u32) {
-    ImGui::PushID3(id);
-    let key_label = CString::from_str(label).unwrap();
-    ImGui::Text(key_label.as_ptr());
-    ImGui::SameLine(0f32, -1f32);
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - 200f32);
-    ImGui::PushItemWidth(200f32);
-
-    let current = BINDABLE_BUTTONS.iter().position(|(_, bit)| *bit == *value);
-    let preview = current.map(|c| BINDABLE_BUTTONS[c].0).unwrap_or(c"None");
-    if ImGui::BeginCombo(c"##btn".as_ptr(), preview.as_ptr(), 0) {
-        let sz = ImVec2 { x: 0f32, y: 0f32 };
-        if ImGui::Selectable(c"None".as_ptr(), current.is_none(), 0, &sz) {
-            *value = 0;
-        }
-        for (j, (name, bit)) in BINDABLE_BUTTONS.iter().enumerate() {
-            let is_selected = current == Some(j);
-            if ImGui::Selectable(name.as_ptr(), is_selected, 0, &sz) {
-                *value = *bit;
-            }
-            if is_selected {
-                ImGui::SetItemDefaultFocus();
-            }
-        }
-        ImGui::EndCombo();
-    }
-    ImGui::PopItemWidth();
-    ImGui::PopID();
-}
-
-/// The new-profile editor: a name plus one combo per GBA key and hotkey. Returns true
-/// once the profile has been saved, which is the caller's cue to close the overlay.
+/// The new-profile editor over the Vita's buttons; the name goes through the system IME.
 pub fn show_controls_create_settings(global_settings: &mut GlobalSettings, edit_context: &mut ControlsEditContext, binding: &mut KeyBinding) -> bool {
-    use crate::key_bindings::{HOTKEY_NAMES, KEY_NAMES, NUM_HOTKEYS, NUM_KEYS};
     unsafe {
-        let has_error = edit_context.empty_name || edit_context.duplicated_name;
-        let mut footer = ImGui::GetFrameHeightWithSpacing();
-        if has_error {
-            footer += ImGui::GetTextLineHeightWithSpacing();
-        }
-        let body_height = (ImGui::GetContentRegionAvail().y - footer).max(0.0);
-
-        let fields_sz = ImVec2 { x: 0.0, y: body_height };
-        ImGui::BeginChild(c"##controls_fields".as_ptr(), &fields_sz, false, 0);
-
-        if layout_field_button("Profile name", &binding.name_c_str()) {
-            binding.name = dialog_input("Profile name", &binding.name, SCE_IME_TYPE_BASIC_LATIN, SCE_IME_DIALOG_TEXTBOX_MODE_DEFAULT, 32);
-        }
-        ImGui::Spacing();
-        ImGui::Separator();
-
-        for i in 0..NUM_KEYS {
-            binding_button_row(i as _, KEY_NAMES[i], &mut binding.buttons[i]);
-        }
-
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::TextDisabled(c"Hotkeys".as_ptr());
-        for i in 0..NUM_HOTKEYS {
-            binding_button_row((NUM_KEYS + i) as _, HOTKEY_NAMES[i], &mut binding.hotkeys[i]);
-        }
-
-        ImGui::EndChild();
-
-        if has_error {
-            ImGui::PushStyleColor(ImGuiCol__ImGuiCol_Text as _, 0xFF0000FF);
-            if edit_context.empty_name {
-                ImGui::Text(c"Profile name can't be empty".as_ptr());
-            } else {
-                ImGui::Text(c"A profile with that name already exists".as_ptr());
+        crate::presenter::ui::show_controls_editor(global_settings, edit_context, binding, &BINDABLE_BUTTONS, |name| {
+            if layout_field_button("Profile name", &CString::new(name.as_str()).unwrap_or_default()) {
+                *name = dialog_input("Profile name", name, SCE_IME_TYPE_BASIC_LATIN, SCE_IME_DIALOG_TEXTBOX_MODE_DEFAULT, 32);
             }
-            ImGui::PopStyleColor(1);
-        }
-
-        let vec = ImVec2 { x: -1.0, y: 0.0 };
-        if ImGui::Button(c"Save profile".as_ptr(), &vec) {
-            *edit_context = ControlsEditContext::default();
-            if binding.name.is_empty() {
-                edit_context.empty_name = true;
-            } else if global_settings.add_custom_controls(binding.clone()) {
-                return true;
-            } else {
-                edit_context.duplicated_name = true;
-            }
-        }
-        false
+        })
     }
 }
 

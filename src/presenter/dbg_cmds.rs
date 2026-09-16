@@ -4,9 +4,14 @@
 //
 // Newline/broadcast-delimited text commands:
 //   press/release <btn> | buttons [<btn>...] |
+//   key <sdl key name> <down|up> | text <string> |
 //   framelimit <0..9> | pause | savestate | loadstate | rewind <on|off> | inst-log | quit
 // btn: a b up down left right start select l r. inst-log arms --inst-log-lazy
 // capture. Replies "ok" or "err: ...".
+//
+// press/release/buttons set GBA keys directly, past the controls profile. key/text
+// instead push real SDL keyboard events, so they go through the profile mapping in
+// poll_event (and reach imgui text fields) exactly like a physical keyboard would.
 
 use crate::core::input;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -62,6 +67,51 @@ pub fn handle_debug_cmd(state: &DebugState, line: &str) -> String {
             state.held_buttons.store(mask, Ordering::Relaxed);
             "ok".to_owned()
         }
+        "key" => {
+            let Some(keycode) = it.next().and_then(sdl2::keyboard::Keycode::from_name) else {
+                return "err: key <sdl key name> <down|up>".to_owned();
+            };
+            let event_type = match it.next() {
+                Some("down") => sdl2::sys::SDL_EventType::SDL_KEYDOWN,
+                Some("up") => sdl2::sys::SDL_EventType::SDL_KEYUP,
+                _ => return "err: key <sdl key name> <down|up>".to_owned(),
+            };
+            let scancode = unsafe { sdl2::sys::SDL_GetScancodeFromKey(keycode as i32) };
+            let mut event = sdl2::sys::SDL_Event {
+                key: sdl2::sys::SDL_KeyboardEvent {
+                    type_: event_type as u32,
+                    timestamp: 0,
+                    windowID: 0,
+                    state: (event_type == sdl2::sys::SDL_EventType::SDL_KEYDOWN) as u8,
+                    repeat: 0,
+                    padding2: 0,
+                    padding3: 0,
+                    keysym: sdl2::sys::SDL_Keysym {
+                        scancode,
+                        sym: keycode as i32,
+                        mod_: 0,
+                        unused: 0,
+                    },
+                },
+            };
+            // SDL_PushEvent is thread-safe; the event joins the main thread's queue.
+            push_sdl_event(&mut event)
+        }
+        "text" => {
+            let text = line.trim_start().strip_prefix("text").unwrap_or("").trim_start();
+            let mut event = sdl2::sys::SDL_Event {
+                text: sdl2::sys::SDL_TextInputEvent {
+                    type_: sdl2::sys::SDL_EventType::SDL_TEXTINPUT as u32,
+                    timestamp: 0,
+                    windowID: 0,
+                    text: [0; 32],
+                },
+            };
+            // One event holds up to 31 bytes plus the terminator.
+            let bytes = &text.as_bytes()[..text.len().min(31)];
+            unsafe { event.text.text[..bytes.len()].copy_from_slice(&*(bytes as *const [u8] as *const [std::ffi::c_char])) };
+            push_sdl_event(&mut event)
+        }
         "framelimit" => match it.next().and_then(|s| s.parse::<i32>().ok()) {
             Some(n @ 0..=9) => {
                 state.pending_framelimit.store(n, Ordering::Relaxed);
@@ -107,6 +157,14 @@ pub fn handle_debug_cmd(state: &DebugState, line: &str) -> String {
             "ok".to_owned()
         }
         other => format!("err: unknown cmd '{other}'"),
+    }
+}
+
+fn push_sdl_event(event: &mut sdl2::sys::SDL_Event) -> String {
+    if unsafe { sdl2::sys::SDL_PushEvent(event) } == 1 {
+        "ok".to_owned()
+    } else {
+        "err: SDL_PushEvent failed".to_owned()
     }
 }
 

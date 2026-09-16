@@ -28,9 +28,9 @@ pub const PRESENTER_SCREEN_HEIGHT: u32 = 544;
 pub enum PresentEvent {
     Inputs { keymap: u32 },
     SetFramelimit(u8),
-    // Steps the screen-layout setting to the next entry, live. Square on the Vita
-    // (unmapped as a GBA key), F12 on the keyboard.
-    CycleScreenLayout,
+    // Steps the screen-layout setting to the next (or previous) entry, live. The Next
+    // and Previous layout hotkeys of the active controls profile.
+    CycleScreenLayout { forward: bool },
     // Savestate hotkeys and the screenshot key come back as events rather than poking
     // the savestate module from inside poll_event: capturing the frame needs the
     // renderer and naming the file needs the loaded rom, and the main loop is the only

@@ -5,14 +5,13 @@ use crate::presenter::imgui::root::{
     ImDrawData, ImGui, ImGuiCol__ImGuiCol_Text, ImGuiConfigFlags__ImGuiConfigFlags_NavEnableKeyboard, ImGuiInputTextFlags__ImGuiInputTextFlags_Password, ImGui_ImplSdlGL3_Init,
     ImGui_ImplSdlGL3_NewFrame, ImGui_ImplSdlGL3_ProcessEvent, ImGui_ImplSdlGL3_RenderDrawData, ImVec2,
 };
-use crate::key_bindings::KeyBinding;
+use crate::key_bindings::{Hotkey, KeyBinding, KEY_CODES, NUM_HOTKEYS, NUM_KEYS};
 use crate::presenter::ui::{ControlsEditContext, RALoginContext};
 use crate::ra_context::RaContext;
 use crate::screen_layout::CustomLayout;
 use crate::presenter::ui::{show_main_menu, MenuLaunch, UiBackend};
 use crate::presenter::{PresentEvent, PRESENTER_AUDIO_OUT_BUF_SIZE, PRESENTER_AUDIO_OUT_SAMPLE_RATE, PRESENTER_SCREEN_HEIGHT, PRESENTER_SCREEN_WIDTH};
 use crate::settings::{Settings, SettingsConfig};
-use crate::utils::BuildNoHasher;
 use clap::{arg, command, value_parser, ArgAction, ArgMatches, Command};
 use gl::types::GLuint;
 use sdl2::audio::{AudioQueue, AudioSpecDesired};
@@ -23,7 +22,6 @@ use std::ffi::{CStr, CString};
 use std::mem;
 use std::ops::BitOrAssign;
 use std::ptr;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::slice;
@@ -59,7 +57,9 @@ pub struct Presenter {
     presenter_audio_out: PresenterAudioOut,
     window: Window,
     _gl_ctx: GLContext,
-    key_code_mapping: HashMap<keyboard::Keycode, input::Keycode, BuildNoHasher>,
+    // The active controls profile's SDL keycodes, in KEY_NAMES / Hotkey order.
+    key_mapping: [u32; NUM_KEYS],
+    hotkey_mapping: [u32; NUM_HOTKEYS],
     event_pump: EventPump,
     // ADVANCEDSLOP_DBG_PORT: a localhost TCP command port for headless control (buttons,
     // framelimit, savestate, inst-log, quit) without a wayland virtual keyboard or signals.
@@ -170,24 +170,13 @@ impl Presenter {
 
         let event_pump = sdl.event_pump().unwrap();
 
-        let mut key_code_mapping = HashMap::default();
-        key_code_mapping.insert(keyboard::Keycode::W, input::Keycode::Up);
-        key_code_mapping.insert(keyboard::Keycode::S, input::Keycode::Down);
-        key_code_mapping.insert(keyboard::Keycode::A, input::Keycode::Left);
-        key_code_mapping.insert(keyboard::Keycode::D, input::Keycode::Right);
-        key_code_mapping.insert(keyboard::Keycode::B, input::Keycode::Start);
-        key_code_mapping.insert(keyboard::Keycode::V, input::Keycode::Select);
-        key_code_mapping.insert(keyboard::Keycode::K, input::Keycode::A);
-        key_code_mapping.insert(keyboard::Keycode::J, input::Keycode::B);
-        key_code_mapping.insert(keyboard::Keycode::Num8, input::Keycode::TriggerL);
-        key_code_mapping.insert(keyboard::Keycode::Num9, input::Keycode::TriggerR);
-
         let mut instance = Presenter {
             arg_matches,
             presenter_audio_out: PresenterAudioOut::new(audio_queue),
             window,
             _gl_ctx: gl_ctx,
-            key_code_mapping,
+            key_mapping: DEFAULT_KEY_MAPPING,
+            hotkey_mapping: DEFAULT_HOTKEY_MAPPING,
             event_pump,
             #[cfg(debug_assertions)]
             debug_state: std::env::var("ADVANCEDSLOP_DBG_PORT").ok().and_then(|p| p.parse::<u16>().ok()).map(spawn_debug_port),
@@ -254,14 +243,33 @@ impl Presenter {
         self.arg_matches.get_one::<String>("savestate").map(PathBuf::from)
     }
 
+    /// Switch to a controls profile; takes effect from the next poll.
+    pub fn set_key_mapping(&mut self, binding: &KeyBinding) {
+        self.key_mapping = binding.buttons;
+        self.hotkey_mapping = binding.hotkeys;
+        // Keys held under the old profile would otherwise never see their release.
+        self.keymap = 0xFFFFFFFF;
+    }
+
     pub fn poll_event(&mut self, _: &Settings) -> PresentEvent {
         for event in self.event_pump.poll_iter() {
             match event {
-                Event::KeyDown {
-                    keycode: Some(keyboard::Keycode::Escape),
-                    ..
-                } => return PresentEvent::Pause,
-                Event::KeyDown { keycode: Some(code), keymod, .. } => {
+                Event::KeyDown { keycode: Some(code), keymod, repeat, .. } => {
+                    // The profile's hotkeys come first, so a profile can take over any of
+                    // the fixed keys below. Key repeat would cycle layouts on a held key.
+                    let key = code as i32 as u32;
+                    if !repeat {
+                        const HOTKEY_EVENTS: [(Hotkey, PresentEvent); NUM_HOTKEYS] = [
+                            (Hotkey::Pause, PresentEvent::Pause),
+                            (Hotkey::NextLayout, PresentEvent::CycleScreenLayout { forward: true }),
+                            (Hotkey::PreviousLayout, PresentEvent::CycleScreenLayout { forward: false }),
+                        ];
+                        for (hotkey, event) in HOTKEY_EVENTS {
+                            if self.hotkey_mapping[hotkey as usize] == key {
+                                return event;
+                            }
+                        }
+                    }
                     // F1-F9 set the framelimit to 1-9 (100%..500%), F10 uncaps it.
                     let function_keys = [
                         keyboard::Keycode::F1,
@@ -296,19 +304,21 @@ impl Presenter {
                     if code == keyboard::Keycode::Backspace {
                         crate::core::rewind::set_rewind_held(true);
                     }
-                    if code == keyboard::Keycode::F12 {
-                        return PresentEvent::CycleScreenLayout;
-                    }
-                    if let Some(code) = self.key_code_mapping.get(&code) {
-                        self.keymap &= !(1 << *code as u8);
+                    for (mapped, gba_key) in self.key_mapping.into_iter().zip(KEY_CODES) {
+                        if mapped == key {
+                            self.keymap &= !(1 << gba_key as u8);
+                        }
                     }
                 }
                 Event::KeyUp { keycode: Some(code), .. } => {
                     if code == keyboard::Keycode::Backspace {
                         crate::core::rewind::set_rewind_held(false);
                     }
-                    if let Some(code) = self.key_code_mapping.get(&code) {
-                        self.keymap |= 1 << *code as u8;
+                    let key = code as i32 as u32;
+                    for (mapped, gba_key) in self.key_mapping.into_iter().zip(KEY_CODES) {
+                        if mapped == key {
+                            self.keymap |= 1 << gba_key as u8;
+                        }
                     }
                 }
                 Event::Quit { .. } => return PresentEvent::Quit,
@@ -550,11 +560,35 @@ pub fn show_retroachievements_settings(global_settings: &mut GlobalSettings, log
     }
 }
 
-/// Linux has no button-capture path — profiles store Vita `SCE_CTRL_*` bits, which a
-/// keyboard cannot produce. The list/delete half of the overlay still works here.
-pub fn show_controls_create_settings(_: &mut GlobalSettings, _: &mut ControlsEditContext, _: &mut KeyBinding) -> bool {
-    unsafe { ImGui::Text(c"Custom controls can only be created on the Vita.".as_ptr()) };
-    false
+lazy_static::lazy_static! {
+    /// Every key a profile can bind, with SDL's name for it: letters, digits, the arrows,
+    /// modifiers and the common punctuation. Escape and F12 are the default pause and
+    /// layout hotkeys, so they are offered too.
+    static ref BINDABLE_KEYS: Vec<(CString, u32)> = {
+        use keyboard::Keycode::*;
+        let keys = [
+            A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
+            Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9,
+            Up, Down, Left, Right, Return, Space, Tab, Escape, F12,
+            LShift, RShift, LCtrl, RCtrl, LAlt, RAlt,
+            Comma, Period, Slash, Semicolon, Quote, LeftBracket, RightBracket, Minus, Equals, Backslash,
+        ];
+        keys.into_iter().map(|key| (CString::new(key.name()).unwrap_or_default(), key as i32 as u32)).collect()
+    };
+}
+
+/// The new-profile editor over the keyboard; the name is a plain text field.
+pub fn show_controls_create_settings(global_settings: &mut GlobalSettings, edit_context: &mut ControlsEditContext, binding: &mut KeyBinding) -> bool {
+    unsafe {
+        crate::presenter::ui::show_controls_editor(global_settings, edit_context, binding, &BINDABLE_KEYS, |name| {
+            let mut buf = [0u8; 33];
+            let len = name.len().min(buf.len() - 1);
+            buf[..len].copy_from_slice(&name.as_bytes()[..len]);
+            if ImGui::InputText(c"Profile name".as_ptr(), buf.as_mut_ptr() as _, buf.len(), 0, None, ptr::null_mut()) {
+                *name = CStr::from_ptr(buf.as_ptr() as _).to_str().unwrap_or("").to_string();
+            }
+        })
+    }
 }
 
 /// Editable text field for the savestate rename dialog. There is a real keyboard here,
@@ -572,10 +606,32 @@ pub fn text_input_field(label: &CStr, value: &mut String, max_len: usize) {
     }
 }
 
-/// The binding a new profile starts from. No Vita buttons exist here, so every key
-/// starts unbound.
+/// Default mapping in KEY_NAMES order: K/J for A/B, WASD for the d-pad, 8/9 for L/R,
+/// V/B for Select/Start.
+const DEFAULT_KEY_MAPPING: [u32; NUM_KEYS] = [
+    keyboard::Keycode::K as i32 as u32,    // A
+    keyboard::Keycode::J as i32 as u32,    // B
+    keyboard::Keycode::D as i32 as u32,    // Right
+    keyboard::Keycode::A as i32 as u32,    // Left
+    keyboard::Keycode::W as i32 as u32,    // Up
+    keyboard::Keycode::S as i32 as u32,    // Down
+    keyboard::Keycode::Num9 as i32 as u32, // R
+    keyboard::Keycode::Num8 as i32 as u32, // L
+    keyboard::Keycode::V as i32 as u32,    // Select
+    keyboard::Keycode::B as i32 as u32,    // Start
+];
+
+/// Defaults in Hotkey order: F12 cycles the layout forward and Escape opens the pause
+/// menu; stepping backwards has no default key.
+const DEFAULT_HOTKEY_MAPPING: [u32; NUM_HOTKEYS] = [0, keyboard::Keycode::F12 as i32 as u32, keyboard::Keycode::Escape as i32 as u32];
+
+/// The binding a new profile starts from: the default mapping.
 pub fn default_key_binding() -> KeyBinding {
-    KeyBinding::default()
+    KeyBinding {
+        name: String::new(),
+        buttons: DEFAULT_KEY_MAPPING,
+        hotkeys: DEFAULT_HOTKEY_MAPPING,
+    }
 }
 
 /// Layout fields on Linux: plain int inputs, since there is a keyboard.

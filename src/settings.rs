@@ -259,20 +259,21 @@ impl Settings {
         unsafe { self.0[SettingId::Controls as usize].value.as_list().unwrap_unchecked().0 }
     }
 
+    /// Rebuild the Controls list from the saved profiles. The selection follows the
+    /// profile's name, not its index, so deleting a profile above the selected one doesn't
+    /// silently switch to its neighbour; a deleted selection falls back to the default.
     pub fn populate_controls(&mut self, default_binding: &KeyBinding, bindings: &[KeyBinding]) {
-        let (_, values) = unsafe { self.0[SettingId::Controls as usize].value.as_list_mut().unwrap_unchecked() };
-        let first_population = values.is_empty();
-        values.clear();
-        values.push(default_binding.name.clone());
+        let SettingValue::List(inner) = &mut self.0[SettingId::Controls as usize].value else {
+            unsafe { unreachable_unchecked() }
+        };
+        // Before the first population the ini's saved name is the selection to restore.
+        let selected = inner.values.get(inner.selection).cloned().unwrap_or_else(|| inner.initial_selection.clone());
+        inner.values.clear();
+        inner.values.push(default_binding.name.clone());
         for binding in bindings {
-            values.push(binding.name.clone());
+            inner.values.push(binding.name.clone());
         }
-        if first_population {
-            match &mut self.0[SettingId::Controls as usize].value {
-                SettingValue::List(inner) => inner.reset_to_initial_selection(),
-                _ => unsafe { unreachable_unchecked() },
-            }
-        }
+        inner.selection = inner.values.iter().position(|name| *name == selected).unwrap_or(0);
     }
 
     /// Rebuild the screen-layout list as the built-in names followed by the saved
@@ -317,9 +318,10 @@ impl Settings {
         unsafe { self.0[SettingId::ScreenLayout as usize].value.as_list().unwrap_unchecked().0 }
     }
 
-    /// Steps to the next layout, wrapping — the in-game hotkey.
-    pub fn cycle_screen_layout(&mut self) {
-        self.0[SettingId::ScreenLayout as usize].value.next();
+    /// Steps to the next or previous layout, wrapping — the in-game hotkeys.
+    pub fn cycle_screen_layout(&mut self, forward: bool) {
+        let (selection, values) = unsafe { self.0[SettingId::ScreenLayout as usize].value.as_list_mut().unwrap_unchecked() };
+        *selection = if forward { (*selection + 1) % values.len() } else { (*selection + values.len() - 1) % values.len() };
     }
 
     pub fn set_framelimit(&mut self, value: u8) {

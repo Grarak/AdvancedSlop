@@ -15,7 +15,7 @@ use crate::presenter::{default_key_binding, show_controls_create_settings, show_
 use crate::ra_context::RaContext;
 use crate::screen_layout::CustomLayout;
 use crate::settings::{Setting, SettingGroup, SettingValue, SettingsConfig};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::{fs, ptr};
 use strum::IntoEnumIterator;
@@ -1071,6 +1071,101 @@ unsafe fn render_custom_controls_overlay(
     }
     *overlay_focused = ImGui::IsWindowFocused(0);
     ImGui::End();
+}
+
+/// One binding row: the key's name, and a combo of every bindable host input.
+unsafe fn binding_row<N: AsRef<CStr>>(id: i32, label: &str, value: &mut u32, bindable: &[(N, u32)]) {
+    ImGui::PushID3(id);
+    let key_label = CString::new(label).unwrap_or_default();
+    ImGui::Text(key_label.as_ptr());
+    ImGui::SameLine(0f32, -1f32);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - 200f32);
+    ImGui::PushItemWidth(200f32);
+
+    let current = bindable.iter().position(|(_, input)| *input == *value);
+    let preview = current.map(|c| bindable[c].0.as_ref()).unwrap_or(c"None");
+    if ImGui::BeginCombo(c"##btn".as_ptr(), preview.as_ptr(), 0) {
+        let sz = ImVec2 { x: 0f32, y: 0f32 };
+        if ImGui::Selectable(c"None".as_ptr(), current.is_none(), 0, &sz) {
+            *value = 0;
+        }
+        for (j, (name, input)) in bindable.iter().enumerate() {
+            let is_selected = current == Some(j);
+            if ImGui::Selectable(name.as_ref().as_ptr(), is_selected, 0, &sz) {
+                *value = *input;
+            }
+            if is_selected {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::PopItemWidth();
+    ImGui::PopID();
+}
+
+/// The new-profile editor, shared by both platforms: `name_field` draws the name input
+/// (a keyboard field or the Vita's IME button), then one combo per GBA key and hotkey
+/// over the platform's `bindable` inputs. Returns true once the profile has been saved,
+/// which is the caller's cue to close the overlay.
+pub unsafe fn show_controls_editor<N: AsRef<CStr>>(
+    global_settings: &mut GlobalSettings,
+    edit_context: &mut ControlsEditContext,
+    binding: &mut KeyBinding,
+    bindable: &[(N, u32)],
+    name_field: impl FnOnce(&mut String),
+) -> bool {
+    use crate::key_bindings::{HOTKEY_NAMES, KEY_NAMES, NUM_HOTKEYS, NUM_KEYS};
+
+    let has_error = edit_context.empty_name || edit_context.duplicated_name;
+    let mut footer = ImGui::GetFrameHeightWithSpacing();
+    if has_error {
+        footer += ImGui::GetTextLineHeightWithSpacing();
+    }
+    let body_height = (ImGui::GetContentRegionAvail().y - footer).max(0.0);
+
+    let fields_sz = ImVec2 { x: 0.0, y: body_height };
+    ImGui::BeginChild(c"##controls_fields".as_ptr(), &fields_sz, false, 0);
+
+    name_field(&mut binding.name);
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    for i in 0..NUM_KEYS {
+        binding_row(i as _, KEY_NAMES[i], &mut binding.buttons[i], bindable);
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextDisabled(c"Hotkeys".as_ptr());
+    for i in 0..NUM_HOTKEYS {
+        binding_row((NUM_KEYS + i) as _, HOTKEY_NAMES[i], &mut binding.hotkeys[i], bindable);
+    }
+
+    ImGui::EndChild();
+
+    if has_error {
+        ImGui::PushStyleColor(ImGuiCol__ImGuiCol_Text as _, 0xFF0000FF);
+        if edit_context.empty_name {
+            ImGui::Text(c"Profile name can't be empty".as_ptr());
+        } else {
+            ImGui::Text(c"A profile with that name already exists".as_ptr());
+        }
+        ImGui::PopStyleColor(1);
+    }
+
+    let vec = ImVec2 { x: -1.0, y: 0.0 };
+    if ImGui::Button(c"Save profile".as_ptr(), &vec) {
+        *edit_context = ControlsEditContext::default();
+        if binding.name.is_empty() {
+            edit_context.empty_name = true;
+        } else if global_settings.add_custom_controls(binding.clone()) {
+            return true;
+        } else {
+            edit_context.duplicated_name = true;
+        }
+    }
+    false
 }
 
 /// Preview, error line and Save button — the half of the layout editor that is the same

@@ -33,6 +33,7 @@ use crate::jit::jit_memory::JitMemory;
 use crate::logging::{debug_println, info_println};
 use crate::mmap::{register_abort_handler, ArmContext, Mmap, PAGE_SIZE};
 use crate::presenter::{default_key_binding, PresentEvent, Presenter, UiPauseMenuReturn, PRESENTER_AUDIO_OUT_BUF_SIZE};
+use crate::key_bindings::KeyBinding;
 use crate::utils::{set_thread_prio_affinity, start_profiling, stop_profiling, HeapArrayU32, ThreadAffinity, ThreadPriority};
 use std::cell::UnsafeCell;
 use std::intrinsics::unlikely;
@@ -372,12 +373,17 @@ pub fn actual_main() {
     // The default profile is index 0 of the Controls setting and the fallback every
     // custom profile inherits hotkeys from, so it has to be the real built-in mapping,
     // not an all-unbound KeyBinding::default().
-    let mut global_settings = GlobalSettings::new(presenter.data_path(), default_key_binding()).unwrap();
+    let default_control = KeyBinding {
+        name: "Default".to_string(),
+        ..default_key_binding()
+    };
+    let mut global_settings = GlobalSettings::new(presenter.data_path(), default_control).unwrap();
     let mut ra_context = RaContext::new();
     ra_context.set_cache_dir(presenter.data_path().join("ra"));
     let _ra_context_thread_guard = ra_context.start_server_request_receive_thread();
     // A stored token gets the session logged back in without asking again.
     settings_config.settings.populate_screen_layouts(&global_settings.custom_layouts);
+    settings_config.settings.populate_controls(&global_settings.default_control, &global_settings.custom_controls);
     if !global_settings.ra_username.is_empty() && !global_settings.ra_token.is_empty() {
         ra_context.login_with_token(&global_settings.ra_username, &global_settings.ra_token);
     }
@@ -409,6 +415,7 @@ pub fn actual_main() {
         };
 
         gba_renderer.set_present_rect(screen_layout::rect_with_custom(settings.screen_layout(), &global_settings.custom_layouts));
+        presenter.set_key_mapping(global_settings.get_control(settings.controls_index()));
         gba_renderer.reset_for_new_game(&emu_unsafe.get_mut().mem.shm);
         emu_unsafe.get_mut().cartridge.set_cartridge_io(cartridge_io);
         emu_unsafe.get_mut().settings = settings;
@@ -537,13 +544,13 @@ pub fn actual_main() {
                     emu_unsafe.get_mut().settings.set_framelimit(value);
                     info_println!("Framelimit set to {value}");
                 }
-                PresentEvent::CycleScreenLayout => {
+                PresentEvent::CycleScreenLayout { forward } => {
                     // Live: the rect is only read by this thread's blit. Both settings
                     // copies step together — the emu's is copied back over the config at
                     // game end, which would otherwise revert the cycle. Dirty so the
                     // choice shows in the pause menu and persists like a menu edit.
-                    settings_config.settings.cycle_screen_layout();
-                    emu_unsafe.get_mut().settings.cycle_screen_layout();
+                    settings_config.settings.cycle_screen_layout(forward);
+                    emu_unsafe.get_mut().settings.cycle_screen_layout(forward);
                     settings_config.dirty = true;
                     gba_renderer.set_present_rect(screen_layout::rect_with_custom(settings_config.settings.screen_layout(), &global_settings.custom_layouts));
                 }
@@ -579,6 +586,7 @@ pub fn actual_main() {
                     // safe up until the unpark below.
                     emu_unsafe.get_mut().settings = settings_config.settings.clone();
                     gba_renderer.set_present_rect(screen_layout::rect_with_custom(settings_config.settings.screen_layout(), &global_settings.custom_layouts));
+                    presenter.set_key_mapping(global_settings.get_control(settings_config.settings.controls_index()));
                     if savestate::op_active() {
                         run_savestate_op(&mut presenter, renderer, cpu_thread.thread());
                     }

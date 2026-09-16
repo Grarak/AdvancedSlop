@@ -1,3 +1,4 @@
+use crate::core::input::Keycode;
 use ini::{Properties, SectionSetter};
 use std::ffi::CString;
 
@@ -10,10 +11,24 @@ pub const NUM_KEYS: usize = 10;
 /// Ten, not the DS's twelve: the GBA has no X or Y.
 pub const KEY_NAMES: [&str; NUM_KEYS] = ["A", "B", "Right", "Left", "Up", "Down", "R", "L", "Select", "Start"];
 
+/// The GBA key behind each `KEY_NAMES` row, so `KeyBinding::buttons[i]` drives `KEY_CODES[i]`.
+pub const KEY_CODES: [Keycode; NUM_KEYS] = [
+    Keycode::A,
+    Keycode::B,
+    Keycode::Right,
+    Keycode::Left,
+    Keycode::Up,
+    Keycode::Down,
+    Keycode::TriggerR,
+    Keycode::TriggerL,
+    Keycode::Select,
+    Keycode::Start,
+];
+
 pub const NUM_HOTKEYS: usize = 3;
 
-/// Actions triggered by holding the PS button together with the bound button.
-/// Values index `KeyBinding::hotkeys` and `HOTKEY_NAMES`.
+/// Actions triggered by pressing the bound button. Values index `KeyBinding::hotkeys`
+/// and `HOTKEY_NAMES`.
 ///
 /// Only the ones a single-screen console can do: the DS's swap-screens, per-screen
 /// scaling, blow-mic and toggle-lid have no GBA meaning.
@@ -30,10 +45,10 @@ pub enum Hotkey {
 /// customizable keep the built-in shortcuts.
 pub const HOTKEY_NAMES: [&str; NUM_HOTKEYS] = ["Previous layout", "Next layout", "Pause menu"];
 
-/// A named custom controls profile: for each GBA key and each hotkey, the host
-/// (Vita) button bits that trigger it. Vita-specific in meaning (the values are
-/// `SCE_CTRL_*` bits) but stored as plain `u32`, so this module stays
-/// platform-agnostic.
+/// A named custom controls profile: for each GBA key and each hotkey, the host input
+/// that triggers it, 0 when unbound. Platform-specific in meaning — `SCE_CTRL_*` bits
+/// on the Vita, an SDL keycode on Linux — but stored as plain `u32`, so this module
+/// stays platform-agnostic. A profile saved on one platform is meaningless on the other.
 #[derive(Clone)]
 pub struct KeyBinding {
     pub name: String,
