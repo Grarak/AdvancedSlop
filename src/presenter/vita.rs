@@ -68,9 +68,6 @@ pub struct Presenter {
     key_mapping: [u32; NUM_KEYS],
     hotkey_mapping: [u32; NUM_HOTKEYS],
     prev_buttons: u32,
-    // Right-stick hotkey edges (quick save/load)
-    prev_right_stick_up: bool,
-    prev_right_stick_down: bool,
 }
 
 impl Presenter {
@@ -116,8 +113,6 @@ impl Presenter {
                 key_mapping: DEFAULT_KEY_MAPPING,
                 hotkey_mapping: DEFAULT_HOTKEY_MAPPING,
                 prev_buttons: 0,
-                prev_right_stick_up: false,
-                prev_right_stick_down: false,
             };
             crate::presenter::ui::init_ui(&mut instance);
             Some(instance)
@@ -230,27 +225,12 @@ impl Presenter {
             }
         }
 
-        // Quick save/load on the right stick, edge-triggered: every button and the left
-        // stick already carry guest input, and the GBA has no second stick, so this is
-        // the one input that cannot collide with the game. These are not part of a
-        // controls profile.
+        // Rewind on the right stick pushed left: every button and the left stick already
+        // carry guest input, and the GBA has no second stick, so this is the one input that
+        // cannot collide with the game. Not part of a controls profile. It is a hold, so it
+        // drives an atomic the emulation thread samples rather than an event.
         const STICK_THRESHOLD: i32 = 64;
-        // Rewind is a hold, so it drives an atomic the emulation thread samples rather
-        // than an event; the stick's other axis carries the save/load edges below.
         crate::core::rewind::set_rewind_held(pressed.rx as i32 - 128 < -STICK_THRESHOLD);
-        let ry = pressed.ry as i32 - 128;
-        let stick_up = ry < -STICK_THRESHOLD;
-        let stick_down = ry > STICK_THRESHOLD;
-        let stick_up_edge = stick_up && !self.prev_right_stick_up;
-        let stick_down_edge = stick_down && !self.prev_right_stick_down;
-        self.prev_right_stick_up = stick_up;
-        self.prev_right_stick_down = stick_down;
-        if stick_up_edge {
-            return PresentEvent::QuickSave;
-        }
-        if stick_down_edge {
-            return PresentEvent::QuickLoad;
-        }
 
         self.keymap = 0xFFFFFFFF;
         for (bits, keycode) in self.key_mapping.into_iter().zip(KEY_CODES) {

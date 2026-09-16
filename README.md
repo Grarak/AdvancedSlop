@@ -39,12 +39,11 @@ Most games run, with these caveats:
 | Start / Select | Start / Select |
 | Pause menu | Triangle |
 | Cycle screen layout | Square |
-| Quick save / load | Right stick up / down |
 | Rewind (hold, enable in settings) | Right stick left |
 
 The buttons, the pause menu and the screen layout hotkeys can be remapped: create a
 profile under Global settings → Custom controls, then pick it in the Controls setting.
-Quick save/load and rewind stay on the right stick.
+Rewind stays on the right stick.
 
 Savestates can also be created, loaded and managed from the pause menu, and a game can be
 resumed from a savestate on its page in the browser.
